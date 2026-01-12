@@ -56,7 +56,7 @@ export default async function handler(req, res) {
                 // ATTEMPT 1: Try 'claude-3.5-sonnet' (Common format)
                 // If this fails, the catch block will tell us why.
                 const response = await puter.ai.chat(history, {
-                    model: 'claude-3.5-sonnet' 
+                    model: 'claude-opus-4.5-20251101' 
                 });
 
                 const replyText = typeof response === 'string' 
