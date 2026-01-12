@@ -1,75 +1,76 @@
 // api/bot.js
 const TelegramBot = require('node-telegram-bot-api');
 const { kv } = require('@vercel/kv');
-// Note: Puter Node.js support imports from a specific path currently
 const { init } = require('@heyputer/puter.js/src/init.cjs');
 
-// Initialize Puter with your Auth Token
 const puter = init(process.env.PUTER_AUTH_TOKEN);
 
 export default async function handler(req, res) {
     const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN);
-    
+
     if (req.method === 'POST') {
         const { body } = req;
-        
-        if (body.message) {
-            const chatId = body.message.chat.id;
-            const userMessage = body.message.text;
 
-            // Show "typing..." status
+        if (body.message && body.message.text) {
+            const chatId = body.message.chat.id;
+            const userMessage = body.message.text.trim(); // Remove extra spaces
+            const dbKey = `chat_history:${chatId}`;
+
+            // --- 1. HANDLE /CLEAR COMMAND ---
+            if (userMessage === '/clear') {
+                try {
+                    // Overwrite history with an empty array (safer than delete)
+                    await kv.set(dbKey, []); 
+                    await bot.sendMessage(chatId, "✅ Conversation history cleared.");
+                } catch (error) {
+                    console.error("Clear Error:", error);
+                    await bot.sendMessage(chatId, "⚠️ Failed to clear memory. Check Vercel logs.");
+                }
+                res.status(200).json({ status: 'ok' });
+                return; // Stop here
+            }
+
+            // --- 2. HANDLE NORMAL CONVERSATION ---
             await bot.sendChatAction(chatId, 'typing');
 
             try {
-                const dbKey = `chat_history:${chatId}`;
-
-                // --- NEW: Handle /clear command ---
-                if (userMessage === '/clear') {
-                    await kv.del(dbKey);
-                    await bot.sendMessage(chatId, "✅ Conversation history cleared. I've forgotten everything we talked about.");
-                    res.status(200).json({ status: 'ok' });
-                    return; // Stop here so we don't send '/clear' to the AI
-                }
-                // ----------------------------------
-
-                // 1. Fetch existing history
+                // Fetch existing history (or default to empty)
                 let history = await kv.get(dbKey);
                 if (!Array.isArray(history)) {
                     history = [];
                 }
 
-                // 2. Add the user's new message to the history
+                // Add user message
                 history.push({ role: 'user', content: userMessage });
 
-                // 3. Send the ENTIRE history to Puter AI
+                // Get AI response
                 const response = await puter.ai.chat(history, {
-                    model: 'claude-opus-4-5-20251101'
+                    model: 'gpt-5-nano'
                 });
 
-                // Extract the text content from the AI response
                 const replyText = typeof response === 'string' 
                     ? response 
                     : response.message?.content || JSON.stringify(response);
 
-                // 4. Add the AI's response to the history
+                // Add AI response to history
                 history.push({ role: 'assistant', content: replyText });
 
-                // 5. Save the updated history back to the database
-                // (Limit to last 20 messages to save space)
+                // Keep only the last 20 messages to save space
                 if (history.length > 20) {
                     history = history.slice(-20);
                 }
+
+                // Save back to database
                 await kv.set(dbKey, history);
 
-                // 6. Send the response to the user
                 await bot.sendMessage(chatId, replyText);
-                
+
             } catch (error) {
-                console.error("Error:", error);
+                console.error("Chat Error:", error);
                 await bot.sendMessage(chatId, "Sorry, I had trouble accessing my memory.");
             }
         }
-        
+
         res.status(200).json({ status: 'ok' });
     } else {
         res.status(200).json({ status: 'ready' });
