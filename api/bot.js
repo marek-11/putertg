@@ -53,10 +53,9 @@ export default async function handler(req, res) {
 
                 history.push({ role: 'user', content: userMessage });
 
-                // ATTEMPT 1: Try 'claude-3.5-sonnet' (Common format)
-                // If this fails, the catch block will tell us why.
+                // SWITCHED TO CLAUDE OPUS 4.5
                 const response = await puter.ai.chat(history, {
-                    model: 'claude-3.5-sonnet' 
+                    model: 'claude-opus-4-5' // Verified model ID for Puter.js
                 });
 
                 const replyText = typeof response === 'string' 
@@ -82,7 +81,6 @@ export default async function handler(req, res) {
 
             } catch (error) {
                 console.error("Chat Error:", error);
-                // SEND ACTUAL ERROR TO USER FOR DEBUGGING
                 await bot.sendMessage(chatId, `⚠️ AI Error: ${error.message || error.toString()}`);
             }
         }
