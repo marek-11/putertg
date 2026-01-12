@@ -56,7 +56,7 @@ export default async function handler(req, res) {
 
                 // SWITCHED TO CLAUDE HERE
                 const response = await puter.ai.chat(history, {
-                    model: 'claude-opus-4-5-20251101' // Changed from 'gpt-5-nano'
+                    model: 'claude-3-5-sonnet' // Changed from 'gpt-5-nano'
                 });
 
                 const replyText = typeof response === 'string' 
