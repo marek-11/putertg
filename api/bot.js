@@ -13,61 +13,70 @@ export default async function handler(req, res) {
 
         if (body.message && body.message.text) {
             const chatId = body.message.chat.id;
-            const userMessage = body.message.text.trim(); // Remove extra spaces
+            const userMessage = body.message.text.trim();
             const dbKey = `chat_history:${chatId}`;
 
             // --- 1. HANDLE /CLEAR COMMAND ---
             if (userMessage === '/clear') {
                 try {
-                    // Overwrite history with an empty array (safer than delete)
                     await kv.set(dbKey, []); 
                     await bot.sendMessage(chatId, "✅ Conversation history cleared.");
                 } catch (error) {
                     console.error("Clear Error:", error);
-                    await bot.sendMessage(chatId, "⚠️ Failed to clear memory. Check Vercel logs.");
+                    await bot.sendMessage(chatId, "⚠️ Failed to clear memory.");
                 }
                 res.status(200).json({ status: 'ok' });
-                return; // Stop here
+                return; 
             }
 
             // --- 2. HANDLE NORMAL CONVERSATION ---
             await bot.sendChatAction(chatId, 'typing');
 
             try {
-                // Fetch existing history (or default to empty)
                 let history = await kv.get(dbKey);
                 if (!Array.isArray(history)) {
                     history = [];
                 }
 
-                // Add user message
                 history.push({ role: 'user', content: userMessage });
 
-                // Get AI response
                 const response = await puter.ai.chat(history, {
-                    model: 'gpt-5.2-chat-latest'
+                    model: 'gpt-5-nano'
                 });
 
                 const replyText = typeof response === 'string' 
                     ? response 
                     : response.message?.content || JSON.stringify(response);
 
-                // Add AI response to history
+                // --- MARKDOWN FIXES ---
+                // Convert standard Markdown (used by AI) to Telegram Legacy Markdown
+                let telegramReply = replyText
+                    // Convert **bold** to *bold*
+                    .replace(/\*\*(.*?)\*\*/g, '*$1*')
+                    // Convert __bold__ to *bold*
+                    .replace(/__(.*?)__/g, '*$1*')
+                    // Convert ## Headers to *Bold Headers*
+                    .replace(/^## (.*$)/gm, '*$1*')
+                    // Convert [text](link) to just url if needed, but Telegram supports links usually.
+                    // Note: We don't touch code blocks (```) as Telegram supports them.
+
+                // Save ORIGINAL text to history (so AI understands context better)
                 history.push({ role: 'assistant', content: replyText });
 
-                // Keep only the last 20 messages to save space
                 if (history.length > 20) {
                     history = history.slice(-20);
                 }
-
-                // Save back to database
                 await kv.set(dbKey, history);
 
-                await bot.sendMessage(chatId, replyText);
+                // Send with Markdown parsing enabled
+                await bot.sendMessage(chatId, telegramReply, { 
+                    parse_mode: 'Markdown' 
+                });
 
             } catch (error) {
                 console.error("Chat Error:", error);
-                await bot.sendMessage(chatId, "Sorry, I had trouble accessing my memory.");
+                // Fallback: If markdown fails (e.g. unclosed symbols), send plain text
+                await bot.sendMessage(chatId, "Sorry, I had trouble processing that response.");
             }
         }
 
