@@ -1,22 +1,16 @@
 // api/bot.js
 const TelegramBot = require('node-telegram-bot-api');
-const { Redis } = require('@upstash/redis');
+// Note: Puter Node.js support imports from a specific path currently
+const { init } = require('@heyputer/puter.js/src/init.cjs');
 
-// Initialize Telegram and Redis (These work fine with require)
-const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN);
-const redis = new Redis({
-  url: process.env.UPSTASH_REDIS_REST_URL,
-  token: process.env.UPSTASH_REDIS_REST_TOKEN,
-});
+// 1. Initialize Puter with your Auth Token (Required for server-side)
+const puter = init(process.env.PUTER_AUTH_TOKEN);
 
 export default async function handler(req, res) {
-    // 1. Dynamic Import for Puter (Fixes the ERR_REQUIRE_ESM error)
-    // We load this INSIDE the function so it doesn't crash the server start
-    const { init } = await import('@heyputer/puter.js');
+    // Basic webhook setup
+    const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN);
     
-    // Initialize Puter with the token
-    const puter = init(process.env.PUTER_AUTH_TOKEN);
-
+    // Vercel serverless function boilerplate
     if (req.method === 'POST') {
         const { body } = req;
         
@@ -24,45 +18,32 @@ export default async function handler(req, res) {
             const chatId = body.message.chat.id;
             const userMessage = body.message.text;
 
-            // --- COMMAND: /clear ---
-            if (userMessage === '/clear') {
-                await redis.del(`chat:${chatId}`);
-                await bot.sendMessage(chatId, "🧹 Memory cleared.");
-                return res.status(200).json({ status: 'cleared' });
-            }
-
+            // Show a "typing..." status to the user
             await bot.sendChatAction(chatId, 'typing');
 
             try {
-                // --- FETCH MEMORY ---
-                let history = await redis.get(`chat:${chatId}`);
-                if (!history || !Array.isArray(history)) history = [];
-
-                // Add User Message
-                history.push({ role: 'user', content: userMessage });
-                if (history.length > 10) history = history.slice(-10);
-
-                // --- ASK PUTER ---
-                const response = await puter.ai.chat(history, {
+                // --- YOUR PUTER LOGIC HERE ---
+                // This replaces the client-side `puter.ai.chat`
+                // We use the same model 'gpt-5-nano' you asked for
+                const response = await puter.ai.chat(userMessage, {
                     model: 'gpt-5-nano'
                 });
 
-                const aiText = typeof response === 'string' 
-                    ? response 
-                    : response.message?.content || JSON.stringify(response);
-
-                // --- SAVE & REPLY ---
-                history.push({ role: 'assistant', content: aiText });
-                await redis.set(`chat:${chatId}`, history, { ex: 86400 });
-                await bot.sendMessage(chatId, aiText);
-
+                // Send the AI response back to Telegram
+                // Note: puter.ai.chat returns a string or object depending on response
+                // We assume it returns the text string directly or .message.content
+                const replyText = typeof response === 'string' ? response : response.message?.content || JSON.stringify(response);
+                
+                await bot.sendMessage(chatId, replyText);
+                
             } catch (error) {
-                console.error("Bot Error:", error);
-                await bot.sendMessage(chatId, "⚠️ Error: " + error.message);
+                console.error("Puter Error:", error);
+                await bot.sendMessage(chatId, "Sorry, I couldn't reach the AI brain.");
             }
         }
-        return res.status(200).json({ status: 'ok' });
+        
+        res.status(200).json({ status: 'ok' });
+    } else {
+        res.status(200).json({ status: 'ready' });
     }
-    
-    res.status(200).json({ status: 'ready' });
 }
