@@ -1,5 +1,6 @@
 // api/bot.js
 const TelegramBot = require('node-telegram-bot-api');
+const { kv } = require('@vercel/kv'); // Import Vercel KV
 // Note: Puter Node.js support imports from a specific path currently
 const { init } = require('@heyputer/puter.js/src/init.cjs');
 
@@ -22,6 +23,14 @@ export default async function handler(req, res) {
             await bot.sendChatAction(chatId, 'typing');
 
             try {
+                // --- UPSTASH KV LOGIC ---
+                // Example: Increment a global message counter in your Redis/KV database
+                // This uses the environment variables you provided automatically
+                const count = await kv.incr('message_count');
+                
+                // You could also store the user's last message:
+                // await kv.set(`user:${chatId}:last_message`, userMessage);
+                
                 // --- YOUR PUTER LOGIC HERE ---
                 // This replaces the client-side `puter.ai.chat`
                 // We use the same model 'gpt-5-nano' you asked for
@@ -32,13 +41,16 @@ export default async function handler(req, res) {
                 // Send the AI response back to Telegram
                 // Note: puter.ai.chat returns a string or object depending on response
                 // We assume it returns the text string directly or .message.content
-                const replyText = typeof response === 'string' ? response : response.message?.content || JSON.stringify(response);
+                let replyText = typeof response === 'string' ? response : response.message?.content || JSON.stringify(response);
                 
+                // Optional: Append the message count for debugging
+                // replyText += `\n\n(Processed message #${count})`;
+
                 await bot.sendMessage(chatId, replyText);
                 
             } catch (error) {
-                console.error("Puter Error:", error);
-                await bot.sendMessage(chatId, "Sorry, I couldn't reach the AI brain.");
+                console.error("Error:", error);
+                await bot.sendMessage(chatId, "Sorry, I encountered an error.");
             }
         }
         
