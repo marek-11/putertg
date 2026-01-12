@@ -1,16 +1,18 @@
 // api/bot.js
 const TelegramBot = require('node-telegram-bot-api');
-// Note: Puter Node.js support imports from a specific path currently
 const { init } = require('@heyputer/puter.js/src/init.cjs');
+const { Redis } = require('@upstash/redis'); // Import Redis
 
-// 1. Initialize Puter with your Auth Token (Required for server-side)
+// Initialize services
 const puter = init(process.env.PUTER_AUTH_TOKEN);
+const redis = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_URL,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN,
+});
 
 export default async function handler(req, res) {
-    // Basic webhook setup
     const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN);
     
-    // Vercel serverless function boilerplate
     if (req.method === 'POST') {
         const { body } = req;
         
@@ -18,30 +20,52 @@ export default async function handler(req, res) {
             const chatId = body.message.chat.id;
             const userMessage = body.message.text;
 
-            // Show a "typing..." status to the user
+            // 1. COMMAND: /clear to reset memory
+            if (userMessage === '/clear') {
+                await redis.del(`chat:${chatId}`);
+                await bot.sendMessage(chatId, "🧠 Memory wiped! I'm ready for a new topic.");
+                return res.status(200).json({ status: 'cleared' });
+            }
+
             await bot.sendChatAction(chatId, 'typing');
 
             try {
-                // --- YOUR PUTER LOGIC HERE ---
-                // This replaces the client-side `puter.ai.chat`
-                // We use the same model 'gpt-5-nano' you asked for
-                const response = await puter.ai.chat(userMessage, {
+                // 2. FETCH HISTORY from Redis
+                // We default to an empty array [] if nothing is found
+                let history = await redis.get(`chat:${chatId}`) || [];
+
+                // 3. ADD NEW USER MESSAGE
+                history.push({ role: 'user', content: userMessage });
+
+                // OPTIONAL: Keep only the last 10 messages to avoid token limits
+                if (history.length > 10) {
+                    history = history.slice(-10);
+                }
+
+                // 4. SEND FULL HISTORY TO PUTER
+                // Most Chat APIs accept an array of messages
+                const response = await puter.ai.chat(history, {
                     model: 'gpt-5-nano'
                 });
 
-                // Send the AI response back to Telegram
-                // Note: puter.ai.chat returns a string or object depending on response
-                // We assume it returns the text string directly or .message.content
-                const replyText = typeof response === 'string' ? response : response.message?.content || JSON.stringify(response);
-                
-                await bot.sendMessage(chatId, replyText);
+                // Extract the text safely
+                const aiText = typeof response === 'string' ? response : response.message?.content;
+
+                // 5. ADD AI RESPONSE TO HISTORY
+                history.push({ role: 'assistant', content: aiText });
+
+                // 6. SAVE BACK TO REDIS
+                // Set to expire in 24 hours (86400 seconds) so old chats don't clutter DB
+                await redis.set(`chat:${chatId}`, history, { ex: 86400 });
+
+                // 7. REPLY TO USER
+                await bot.sendMessage(chatId, aiText);
                 
             } catch (error) {
-                console.error("Puter Error:", error);
-                await bot.sendMessage(chatId, "Sorry, I couldn't reach the AI brain.");
+                console.error("Error:", error);
+                await bot.sendMessage(chatId, "My brain hurt. Try /clear to reset.");
             }
         }
-        
         res.status(200).json({ status: 'ok' });
     } else {
         res.status(200).json({ status: 'ready' });
