@@ -3,8 +3,6 @@ const TelegramBot = require('node-telegram-bot-api');
 const { kv } = require('@vercel/kv');
 const { init } = require('@heyputer/puter.js/src/init.cjs');
 
-// Removed global 'init' to allow per-request token rotation
-
 export default async function handler(req, res) {
     const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN);
 
@@ -53,24 +51,46 @@ export default async function handler(req, res) {
 
                 history.push({ role: 'user', content: userMessage });
 
-                // --- TOKEN ROTATION LOGIC ---
-                // 1. Get raw string and split by comma
-                const rawTokens = (process.env.PUTER_AUTH_TOKEN || '').split(',');
-                // 2. Clean up whitespace and remove empty entries
-                const tokens = rawTokens.map(t => t.trim()).filter(Boolean);
+                // --- NEW: TOKEN FETCHING LOGIC ---
+                let rawTokensString = '';
 
-                if (tokens.length === 0) {
-                    throw new Error("No PUTER_AUTH_TOKEN provided.");
+                // A. Try fetching from Gist URL first
+                if (process.env.TOKEN_GIST_URL) {
+                    try {
+                        const gistResponse = await fetch(process.env.TOKEN_GIST_URL);
+                        if (gistResponse.ok) {
+                            rawTokensString = await gistResponse.text();
+                        } else {
+                            console.error("Failed to fetch Gist:", gistResponse.statusText);
+                        }
+                    } catch (err) {
+                        console.error("Gist Fetch Error:", err);
+                    }
                 }
 
-                // 3. Pick a random token
+                // B. Fallback to Environment Variable if Gist failed or is missing
+                if (!rawTokensString && process.env.PUTER_AUTH_TOKEN) {
+                    rawTokensString = process.env.PUTER_AUTH_TOKEN;
+                }
+
+                // C. Parse Tokens
+                const tokens = rawTokensString
+                    .split(',')
+                    .map(t => t.trim())
+                    .filter(Boolean); // Remove empty strings
+
+                if (tokens.length === 0) {
+                    throw new Error("No PUTER_AUTH_TOKEN found (checked Gist and Env Vars).");
+                }
+
+                // D. Pick Random Token
                 const selectedToken = tokens[Math.floor(Math.random() * tokens.length)];
                 
-                // 4. Initialize Puter with this specific token
+                // Initialize Puter
                 const puter = init(selectedToken);
+                // ---------------------------------
 
-
-                // --- SYSTEM PROMPT LOGIC ---
+                // --- SYSTEM PROMPT ---
                 let messagesToSend = [...history];
                 if (process.env.SYSTEM_PROMPT) {
                     messagesToSend.unshift({ 
@@ -84,9 +104,8 @@ export default async function handler(req, res) {
                     model: 'claude-opus-4-5' 
                 });
 
-                // --- ROBUST RESPONSE PARSING ---
+                // --- RESPONSE PARSING ---
                 let replyText = '';
-                
                 if (typeof response === 'string') {
                     replyText = response;
                 } else if (response?.message?.content) {
