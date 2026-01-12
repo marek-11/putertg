@@ -25,7 +25,6 @@ export default async function handler(req, res) {
                 return; 
             }
 
-            // --- COMMANDS ---
             if (userMessage === '/start') {
                 await bot.sendMessage(chatId, "Hi");
                 res.status(200).json({ status: 'ok' });
@@ -46,7 +45,6 @@ export default async function handler(req, res) {
                 return; 
             }
 
-            // --- PROCESSING ---
             await bot.sendChatAction(chatId, 'typing');
 
             try {
@@ -57,7 +55,6 @@ export default async function handler(req, res) {
 
                 history.push({ role: 'user', content: userMessage });
 
-                // --- TOKEN LOGIC ---
                 const rawTokensString = process.env.PUTER_AUTH_TOKEN;
                 if (!rawTokensString) throw new Error("No PUTER_AUTH_TOKEN found.");
                 
@@ -68,17 +65,16 @@ export default async function handler(req, res) {
                 const puter = init(selectedToken);
 
                 // --- SYSTEM PROMPT ---
+                // We strongly suggest adding "Write in plain text only" to your SYSTEM_PROMPT env var too!
                 let messagesToSend = [...history];
                 if (process.env.SYSTEM_PROMPT) {
                     messagesToSend.unshift({ role: 'system', content: process.env.SYSTEM_PROMPT });
                 }
 
-                // --- CALL AI ---
                 const response = await puter.ai.chat(messagesToSend, {
                     model: 'claude-opus-4-5' 
                 });
 
-                // --- PARSE RESPONSE ---
                 let replyText = '';
                 if (typeof response === 'string') {
                     replyText = response;
@@ -98,21 +94,29 @@ export default async function handler(req, res) {
                     replyText = JSON.stringify(response);
                 }
 
-                // --- SAVE HISTORY ---
-                // We save the raw text exactly as the AI gave it
-                history.push({ role: 'assistant', content: replyText });
+                // --- CLEAN TEXT (Remove Markdown Symbols) ---
+                // This strips out **, __, and ` but leaves the text inside.
+                let cleanReply = replyText
+                    .replace(/\*\*(.*?)\*\*/g, '$1')   // Replace **bold** with bold
+                    .replace(/__(.*?)__/g, '$1')       // Replace __bold__ with bold
+                    .replace(/`(.*?)`/g, '$1')         // Replace `code` with code
+                    .replace(/^#+\s+/gm, '')           // Remove # Headers
+                    .replace(/\n\s*-\s/g, '\n• ')      // Optional: Make list dashes look nicer
+                    .replace(/\*/g, '');               // Remove any stray single asterisks
+
+                // Save the CLEANED text to history so the bot remembers plain text too
+                history.push({ role: 'assistant', content: cleanReply });
                 if (history.length > 20) history = history.slice(-20);
                 await kv.set(dbKey, history);
 
-                // --- SEND PLAIN TEXT (No Formatting) ---
-                // We removed the .replace() logic and the parse_mode: 'Markdown'
+                // --- SEND PLAIN TEXT ---
                 const MAX_CHUNK_SIZE = 4000;
                 
-                if (replyText.length <= MAX_CHUNK_SIZE) {
-                    await bot.sendMessage(chatId, replyText);
+                if (cleanReply.length <= MAX_CHUNK_SIZE) {
+                    await bot.sendMessage(chatId, cleanReply);
                 } else {
-                    for (let i = 0; i < replyText.length; i += MAX_CHUNK_SIZE) {
-                        const chunk = replyText.substring(i, i + MAX_CHUNK_SIZE);
+                    for (let i = 0; i < cleanReply.length; i += MAX_CHUNK_SIZE) {
+                        const chunk = cleanReply.substring(i, i + MAX_CHUNK_SIZE);
                         await bot.sendMessage(chatId, chunk);
                     }
                 }
