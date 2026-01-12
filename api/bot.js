@@ -65,7 +65,6 @@ export default async function handler(req, res) {
                 const puter = init(selectedToken);
 
                 // --- SYSTEM PROMPT ---
-                // We strongly suggest adding "Write in plain text only" to your SYSTEM_PROMPT env var too!
                 let messagesToSend = [...history];
                 if (process.env.SYSTEM_PROMPT) {
                     messagesToSend.unshift({ role: 'system', content: process.env.SYSTEM_PROMPT });
@@ -94,17 +93,27 @@ export default async function handler(req, res) {
                     replyText = JSON.stringify(response);
                 }
 
-                // --- CLEAN TEXT (Remove Markdown Symbols) ---
-                // This strips out **, __, and ` but leaves the text inside.
+                // --- CLEAN TEXT (Remove Markdown Symbols & Gaps) ---
                 let cleanReply = replyText
-                    .replace(/\*\*(.*?)\*\*/g, '$1')   // Replace **bold** with bold
-                    .replace(/__(.*?)__/g, '$1')       // Replace __bold__ with bold
-                    .replace(/`(.*?)`/g, '$1')         // Replace `code` with code
+                    // 1. Remove Markdown Formatting
+                    .replace(/\*\*(.*?)\*\*/g, '$1')   // Remove **bold**
+                    .replace(/__(.*?)__/g, '$1')       // Remove __bold__
+                    .replace(/`(.*?)`/g, '$1')         // Remove `code`
                     .replace(/^#+\s+/gm, '')           // Remove # Headers
-                    .replace(/\n\s*-\s/g, '\n• ')      // Optional: Make list dashes look nicer
-                    .replace(/\*/g, '');               // Remove any stray single asterisks
+                    
+                    // 2. Remove Horizontal Rules (---, ___, ***)
+                    // Matches a line containing only dashes/underscores/stars
+                    .replace(/^\s*[-_*]{3,}\s*$/gm, '') 
+                    
+                    // 3. Clean up Lists and Asterisks
+                    .replace(/\n\s*-\s/g, '\n• ')      // Nice bullets
+                    .replace(/\*/g, '')                // Remove stray stars
+                    
+                    // 4. Remove Extra Vertical Gaps
+                    // Replaces 3 or more newlines with just 2
+                    .replace(/\n{3,}/g, '\n\n')
+                    .trim();
 
-                // Save the CLEANED text to history so the bot remembers plain text too
                 history.push({ role: 'assistant', content: cleanReply });
                 if (history.length > 20) history = history.slice(-20);
                 await kv.set(dbKey, history);
