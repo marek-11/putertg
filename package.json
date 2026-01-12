@@ -1,5 +1,4 @@
 {
-  "type": "module",
   "dependencies": {
     "node-telegram-bot-api": "^0.61.0",
     "@heyputer/puter.js": "^2.0.0",
