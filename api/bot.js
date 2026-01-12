@@ -51,38 +51,20 @@ export default async function handler(req, res) {
 
                 history.push({ role: 'user', content: userMessage });
 
-                // --- TOKEN FETCHING (WITH CACHE BUSTING) ---
-                let rawTokensString = '';
+                // --- SIMPLIFIED TOKEN LOGIC (Reverted to Env Var) ---
+                const rawTokensString = process.env.PUTER_AUTH_TOKEN;
                 
-                if (process.env.TOKEN_GIST_URL) {
-                    try {
-                        // FIX: Add a random timestamp to URL to bypass GitHub cache
-                        // e.g. .../raw/tokens.txt?t=1738492000
-                        const separator = process.env.TOKEN_GIST_URL.includes('?') ? '&' : '?';
-                        const urlWithCacheBuster = `${process.env.TOKEN_GIST_URL}${separator}t=${Date.now()}`;
-                        
-                        const gistResponse = await fetch(urlWithCacheBuster, {
-                            cache: 'no-store' // Tell Vercel/Node not to cache this request
-                        });
-                        
-                        if (gistResponse.ok) {
-                            rawTokensString = await gistResponse.text();
-                        } else {
-                            console.error("Gist Fetch Failed:", gistResponse.status, gistResponse.statusText);
-                        }
-                    } catch (err) { 
-                        console.error("Gist Error:", err); 
-                    }
+                if (!rawTokensString) {
+                    throw new Error("No PUTER_AUTH_TOKEN found in Environment Variables.");
                 }
 
-                // Fallback to static Env Var if Gist failed
-                if (!rawTokensString && process.env.PUTER_AUTH_TOKEN) {
-                    rawTokensString = process.env.PUTER_AUTH_TOKEN;
-                }
-                
+                // Split by comma to support multiple tokens (Rotation)
                 const tokens = rawTokensString.split(',').map(t => t.trim()).filter(Boolean);
-                if (tokens.length === 0) throw new Error("No PUTER_AUTH_TOKEN found in Gist or Env.");
                 
+                if (tokens.length === 0) {
+                    throw new Error("PUTER_AUTH_TOKEN is empty.");
+                }
+
                 // Pick random token
                 const selectedToken = tokens[Math.floor(Math.random() * tokens.length)];
                 const puter = init(selectedToken);
@@ -93,7 +75,7 @@ export default async function handler(req, res) {
                     messagesToSend.unshift({ role: 'system', content: process.env.SYSTEM_PROMPT });
                 }
 
-                // --- CALL AI ---
+                // --- CALL AI (Claude Opus 4.5) ---
                 const response = await puter.ai.chat(messagesToSend, {
                     model: 'claude-opus-4-5' 
                 });
