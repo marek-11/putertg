@@ -21,41 +21,47 @@ export default async function handler(req, res) {
             await bot.sendChatAction(chatId, 'typing');
 
             try {
-                // 1. Define a unique key for this chat's history
                 const dbKey = `chat_history:${chatId}`;
 
-                // 2. Fetch existing history from Vercel KV (Upstash)
-                // If no history exists, default to an empty array []
+                // --- NEW: Handle /clear command ---
+                if (userMessage === '/clear') {
+                    await kv.del(dbKey);
+                    await bot.sendMessage(chatId, "✅ Conversation history cleared. I've forgotten everything we talked about.");
+                    res.status(200).json({ status: 'ok' });
+                    return; // Stop here so we don't send '/clear' to the AI
+                }
+                // ----------------------------------
+
+                // 1. Fetch existing history
                 let history = await kv.get(dbKey);
                 if (!Array.isArray(history)) {
                     history = [];
                 }
 
-                // 3. Add the user's new message to the history
+                // 2. Add the user's new message to the history
                 history.push({ role: 'user', content: userMessage });
 
-                // 4. Send the ENTIRE history to Puter AI
+                // 3. Send the ENTIRE history to Puter AI
                 const response = await puter.ai.chat(history, {
                     model: 'gpt-5-nano'
                 });
 
                 // Extract the text content from the AI response
-                // (Handles both string and object responses)
                 const replyText = typeof response === 'string' 
                     ? response 
                     : response.message?.content || JSON.stringify(response);
 
-                // 5. Add the AI's response to the history
+                // 4. Add the AI's response to the history
                 history.push({ role: 'assistant', content: replyText });
 
-                // 6. Save the updated history back to the database
-                // (Optional: Limit to last 20 messages to save space)
+                // 5. Save the updated history back to the database
+                // (Limit to last 20 messages to save space)
                 if (history.length > 20) {
                     history = history.slice(-20);
                 }
                 await kv.set(dbKey, history);
 
-                // 7. Send the response to the user
+                // 6. Send the response to the user
                 await bot.sendMessage(chatId, replyText);
                 
             } catch (error) {
