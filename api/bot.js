@@ -51,22 +51,41 @@ export default async function handler(req, res) {
 
                 history.push({ role: 'user', content: userMessage });
 
-                // --- TOKEN FETCHING ---
+                // --- TOKEN FETCHING (WITH CACHE BUSTING) ---
                 let rawTokensString = '';
+                
                 if (process.env.TOKEN_GIST_URL) {
                     try {
-                        const gistResponse = await fetch(process.env.TOKEN_GIST_URL);
-                        if (gistResponse.ok) rawTokensString = await gistResponse.text();
-                    } catch (err) { console.error("Gist Error:", err); }
+                        // FIX: Add a random timestamp to URL to bypass GitHub cache
+                        // e.g. .../raw/tokens.txt?t=1738492000
+                        const separator = process.env.TOKEN_GIST_URL.includes('?') ? '&' : '?';
+                        const urlWithCacheBuster = `${process.env.TOKEN_GIST_URL}${separator}t=${Date.now()}`;
+                        
+                        const gistResponse = await fetch(urlWithCacheBuster, {
+                            cache: 'no-store' // Tell Vercel/Node not to cache this request
+                        });
+                        
+                        if (gistResponse.ok) {
+                            rawTokensString = await gistResponse.text();
+                        } else {
+                            console.error("Gist Fetch Failed:", gistResponse.status, gistResponse.statusText);
+                        }
+                    } catch (err) { 
+                        console.error("Gist Error:", err); 
+                    }
                 }
+
+                // Fallback to static Env Var if Gist failed
                 if (!rawTokensString && process.env.PUTER_AUTH_TOKEN) {
                     rawTokensString = process.env.PUTER_AUTH_TOKEN;
                 }
                 
                 const tokens = rawTokensString.split(',').map(t => t.trim()).filter(Boolean);
-                if (tokens.length === 0) throw new Error("No PUTER_AUTH_TOKEN found.");
+                if (tokens.length === 0) throw new Error("No PUTER_AUTH_TOKEN found in Gist or Env.");
                 
-                const puter = init(tokens[Math.floor(Math.random() * tokens.length)]);
+                // Pick random token
+                const selectedToken = tokens[Math.floor(Math.random() * tokens.length)];
+                const puter = init(selectedToken);
 
                 // --- SYSTEM PROMPT ---
                 let messagesToSend = [...history];
@@ -109,22 +128,17 @@ export default async function handler(req, res) {
                 if (history.length > 20) history = history.slice(-20);
                 await kv.set(dbKey, history);
 
-                // --- NEW: SPLIT LONG MESSAGES ---
-                // Telegram max is 4096. We use 4000 to be safe.
+                // --- SPLIT LONG MESSAGES ---
                 const MAX_CHUNK_SIZE = 4000;
                 
                 if (telegramReply.length <= MAX_CHUNK_SIZE) {
-                    // Send normally if short enough
                     await bot.sendMessage(chatId, telegramReply, { parse_mode: 'Markdown' });
                 } else {
-                    // Split into chunks if too long
                     for (let i = 0; i < telegramReply.length; i += MAX_CHUNK_SIZE) {
                         const chunk = telegramReply.substring(i, i + MAX_CHUNK_SIZE);
                         try {
-                            // Try sending with Markdown
                             await bot.sendMessage(chatId, chunk, { parse_mode: 'Markdown' });
                         } catch (err) {
-                            // If Markdown fails (e.g. split in the middle of *bold*), send as plain text
                             await bot.sendMessage(chatId, chunk);
                         }
                     }
