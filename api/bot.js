@@ -1,17 +1,15 @@
 // api/bot.js
 const TelegramBot = require('node-telegram-bot-api');
-const { kv } = require('@vercel/kv'); // Import Vercel KV
+const { kv } = require('@vercel/kv');
 // Note: Puter Node.js support imports from a specific path currently
 const { init } = require('@heyputer/puter.js/src/init.cjs');
 
-// 1. Initialize Puter with your Auth Token (Required for server-side)
+// Initialize Puter with your Auth Token
 const puter = init(process.env.PUTER_AUTH_TOKEN);
 
 export default async function handler(req, res) {
-    // Basic webhook setup
     const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN);
     
-    // Vercel serverless function boilerplate
     if (req.method === 'POST') {
         const { body } = req;
         
@@ -19,38 +17,50 @@ export default async function handler(req, res) {
             const chatId = body.message.chat.id;
             const userMessage = body.message.text;
 
-            // Show a "typing..." status to the user
+            // Show "typing..." status
             await bot.sendChatAction(chatId, 'typing');
 
             try {
-                // --- UPSTASH KV LOGIC ---
-                // Example: Increment a global message counter in your Redis/KV database
-                // This uses the environment variables you provided automatically
-                const count = await kv.incr('message_count');
-                
-                // You could also store the user's last message:
-                // await kv.set(`user:${chatId}:last_message`, userMessage);
-                
-                // --- YOUR PUTER LOGIC HERE ---
-                // This replaces the client-side `puter.ai.chat`
-                // We use the same model 'gpt-5-nano' you asked for
-                const response = await puter.ai.chat(userMessage, {
+                // 1. Define a unique key for this chat's history
+                const dbKey = `chat_history:${chatId}`;
+
+                // 2. Fetch existing history from Vercel KV (Upstash)
+                // If no history exists, default to an empty array []
+                let history = await kv.get(dbKey);
+                if (!Array.isArray(history)) {
+                    history = [];
+                }
+
+                // 3. Add the user's new message to the history
+                history.push({ role: 'user', content: userMessage });
+
+                // 4. Send the ENTIRE history to Puter AI
+                const response = await puter.ai.chat(history, {
                     model: 'gpt-5-nano'
                 });
 
-                // Send the AI response back to Telegram
-                // Note: puter.ai.chat returns a string or object depending on response
-                // We assume it returns the text string directly or .message.content
-                let replyText = typeof response === 'string' ? response : response.message?.content || JSON.stringify(response);
-                
-                // Optional: Append the message count for debugging
-                // replyText += `\n\n(Processed message #${count})`;
+                // Extract the text content from the AI response
+                // (Handles both string and object responses)
+                const replyText = typeof response === 'string' 
+                    ? response 
+                    : response.message?.content || JSON.stringify(response);
 
+                // 5. Add the AI's response to the history
+                history.push({ role: 'assistant', content: replyText });
+
+                // 6. Save the updated history back to the database
+                // (Optional: Limit to last 20 messages to save space)
+                if (history.length > 20) {
+                    history = history.slice(-20);
+                }
+                await kv.set(dbKey, history);
+
+                // 7. Send the response to the user
                 await bot.sendMessage(chatId, replyText);
                 
             } catch (error) {
                 console.error("Error:", error);
-                await bot.sendMessage(chatId, "Sorry, I encountered an error.");
+                await bot.sendMessage(chatId, "Sorry, I had trouble accessing my memory.");
             }
         }
         
