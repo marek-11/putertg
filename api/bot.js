@@ -53,34 +53,44 @@ export default async function handler(req, res) {
 
                 history.push({ role: 'user', content: userMessage });
 
-                // --- CALL AI ---
+                // --- CALL CLAUDE OPUS 4.5 ---
+                // Using the specific model ID for Opus 4.5
                 const response = await puter.ai.chat(history, {
                     model: 'claude-opus-4-5' 
                 });
 
-                // --- SAFETY CHECKS (Fixes the crash) ---
-                if (!response) {
-                    throw new Error("AI Service returned an empty response.");
-                }
-
-                // Determine the text content safely
-                let replyText;
+                // --- ROBUST RESPONSE PARSING ---
+                // Fixes "AI response was not text" error by handling Arrays
+                let replyText = '';
+                
                 if (typeof response === 'string') {
+                    // Simple string response
                     replyText = response;
-                } else if (response.message && response.message.content) {
-                    replyText = response.message.content;
+                } else if (response?.message?.content) {
+                    const content = response.message.content;
+                    
+                    if (typeof content === 'string') {
+                        // Standard object structure
+                        replyText = content;
+                    } else if (Array.isArray(content)) {
+                        // Advanced structure (Claude Opus 4.5 often uses this)
+                        // Joins all text blocks together
+                        replyText = content
+                            .filter(item => item.type === 'text' || item.text)
+                            .map(item => item.text || '')
+                            .join('');
+                    } else {
+                        // Fallback: try to stringify whatever we got
+                        replyText = JSON.stringify(content);
+                    }
                 } else {
-                    // If it's an object but not the expected format, confirm it's valid JSON
+                    // Fallback for completely unexpected structures
                     replyText = JSON.stringify(response);
                 }
 
-                // Final check to ensure we have a string before .replace()
-                if (typeof replyText !== 'string') {
-                    replyText = "⚠️ Error: AI response was not text.";
-                }
-
                 // --- MARKDOWN FIXES ---
-                // Only run replace if we actually have a valid string
+                // 1. Convert **bold** to *bold* (Telegram requirement)
+                // 2. Convert headers (###) to *bold*
                 let telegramReply = replyText
                     .replace(/\*\*(.*?)\*\*/g, '*$1*') 
                     .replace(/__(.*?)__/g, '*$1*')     
