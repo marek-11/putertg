@@ -43,7 +43,7 @@ export default async function handler(req, res) {
 
                 // 3. Send the ENTIRE history to Puter AI
                 const response = await puter.ai.chat(history, {
-                    model: 'gpt-5-nano'
+                    model: 'claude-opus-4-5-20251101'
                 });
 
                 // Extract the text content from the AI response
