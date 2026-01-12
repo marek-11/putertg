@@ -25,6 +25,13 @@ export default async function handler(req, res) {
                 return; 
             }
 
+            // --- HANDLE /START COMMAND ---
+            if (userMessage === '/start') {
+                await bot.sendMessage(chatId, "Hi");
+                res.status(200).json({ status: 'ok' });
+                return; // Stop here, don't call AI
+            }
+
             const dbKey = `chat_history:${chatId}`;
 
             // --- 1. HANDLE /CLEAR COMMAND ---
@@ -51,21 +58,13 @@ export default async function handler(req, res) {
 
                 history.push({ role: 'user', content: userMessage });
 
-                // --- SIMPLIFIED TOKEN LOGIC (Reverted to Env Var) ---
+                // --- TOKEN LOGIC ---
                 const rawTokensString = process.env.PUTER_AUTH_TOKEN;
+                if (!rawTokensString) throw new Error("No PUTER_AUTH_TOKEN found.");
                 
-                if (!rawTokensString) {
-                    throw new Error("No PUTER_AUTH_TOKEN found in Environment Variables.");
-                }
-
-                // Split by comma to support multiple tokens (Rotation)
                 const tokens = rawTokensString.split(',').map(t => t.trim()).filter(Boolean);
-                
-                if (tokens.length === 0) {
-                    throw new Error("PUTER_AUTH_TOKEN is empty.");
-                }
+                if (tokens.length === 0) throw new Error("PUTER_AUTH_TOKEN is empty.");
 
-                // Pick random token
                 const selectedToken = tokens[Math.floor(Math.random() * tokens.length)];
                 const puter = init(selectedToken);
 
@@ -75,7 +74,7 @@ export default async function handler(req, res) {
                     messagesToSend.unshift({ role: 'system', content: process.env.SYSTEM_PROMPT });
                 }
 
-                // --- CALL AI (Claude Opus 4.5) ---
+                // --- CALL AI ---
                 const response = await puter.ai.chat(messagesToSend, {
                     model: 'claude-opus-4-5' 
                 });
