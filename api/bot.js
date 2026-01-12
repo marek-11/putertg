@@ -53,44 +53,45 @@ export default async function handler(req, res) {
 
                 history.push({ role: 'user', content: userMessage });
 
-                // --- CALL CLAUDE OPUS 4.5 ---
-                // Using the specific model ID for Opus 4.5
-                const response = await puter.ai.chat(history, {
+                // --- SYSTEM PROMPT LOGIC ---
+                // We create a temporary copy of the messages to send to the AI.
+                // We add the System Prompt at the very beginning.
+                let messagesToSend = [...history];
+                
+                if (process.env.SYSTEM_PROMPT) {
+                    messagesToSend.unshift({ 
+                        role: 'system', 
+                        content: process.env.SYSTEM_PROMPT 
+                    });
+                }
+
+                // --- CALL AI ---
+                const response = await puter.ai.chat(messagesToSend, {
                     model: 'claude-opus-4-5' 
                 });
 
                 // --- ROBUST RESPONSE PARSING ---
-                // Fixes "AI response was not text" error by handling Arrays
                 let replyText = '';
                 
                 if (typeof response === 'string') {
-                    // Simple string response
                     replyText = response;
                 } else if (response?.message?.content) {
                     const content = response.message.content;
-                    
                     if (typeof content === 'string') {
-                        // Standard object structure
                         replyText = content;
                     } else if (Array.isArray(content)) {
-                        // Advanced structure (Claude Opus 4.5 often uses this)
-                        // Joins all text blocks together
                         replyText = content
                             .filter(item => item.type === 'text' || item.text)
                             .map(item => item.text || '')
                             .join('');
                     } else {
-                        // Fallback: try to stringify whatever we got
                         replyText = JSON.stringify(content);
                     }
                 } else {
-                    // Fallback for completely unexpected structures
                     replyText = JSON.stringify(response);
                 }
 
                 // --- MARKDOWN FIXES ---
-                // 1. Convert **bold** to *bold* (Telegram requirement)
-                // 2. Convert headers (###) to *bold*
                 let telegramReply = replyText
                     .replace(/\*\*(.*?)\*\*/g, '*$1*') 
                     .replace(/__(.*?)__/g, '*$1*')     
