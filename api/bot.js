@@ -51,60 +51,35 @@ export default async function handler(req, res) {
 
                 history.push({ role: 'user', content: userMessage });
 
-                // --- NEW: TOKEN FETCHING LOGIC ---
+                // --- TOKEN FETCHING ---
                 let rawTokensString = '';
-
-                // A. Try fetching from Gist URL first
                 if (process.env.TOKEN_GIST_URL) {
                     try {
                         const gistResponse = await fetch(process.env.TOKEN_GIST_URL);
-                        if (gistResponse.ok) {
-                            rawTokensString = await gistResponse.text();
-                        } else {
-                            console.error("Failed to fetch Gist:", gistResponse.statusText);
-                        }
-                    } catch (err) {
-                        console.error("Gist Fetch Error:", err);
-                    }
+                        if (gistResponse.ok) rawTokensString = await gistResponse.text();
+                    } catch (err) { console.error("Gist Error:", err); }
                 }
-
-                // B. Fallback to Environment Variable if Gist failed or is missing
                 if (!rawTokensString && process.env.PUTER_AUTH_TOKEN) {
                     rawTokensString = process.env.PUTER_AUTH_TOKEN;
                 }
-
-                // C. Parse Tokens
-                const tokens = rawTokensString
-                    .split(',')
-                    .map(t => t.trim())
-                    .filter(Boolean); // Remove empty strings
-
-                if (tokens.length === 0) {
-                    throw new Error("No PUTER_AUTH_TOKEN found (checked Gist and Env Vars).");
-                }
-
-                // D. Pick Random Token
-                const selectedToken = tokens[Math.floor(Math.random() * tokens.length)];
                 
-                // Initialize Puter
-                const puter = init(selectedToken);
-                // ---------------------------------
+                const tokens = rawTokensString.split(',').map(t => t.trim()).filter(Boolean);
+                if (tokens.length === 0) throw new Error("No PUTER_AUTH_TOKEN found.");
+                
+                const puter = init(tokens[Math.floor(Math.random() * tokens.length)]);
 
                 // --- SYSTEM PROMPT ---
                 let messagesToSend = [...history];
                 if (process.env.SYSTEM_PROMPT) {
-                    messagesToSend.unshift({ 
-                        role: 'system', 
-                        content: process.env.SYSTEM_PROMPT 
-                    });
+                    messagesToSend.unshift({ role: 'system', content: process.env.SYSTEM_PROMPT });
                 }
 
-                // --- CALL AI (Claude Opus 4.5) ---
+                // --- CALL AI ---
                 const response = await puter.ai.chat(messagesToSend, {
                     model: 'claude-opus-4-5' 
                 });
 
-                // --- RESPONSE PARSING ---
+                // --- PARSE RESPONSE ---
                 let replyText = '';
                 if (typeof response === 'string') {
                     replyText = response;
@@ -131,15 +106,29 @@ export default async function handler(req, res) {
                     .replace(/^#{1,6}\s+(.*$)/gm, '*$1*'); 
 
                 history.push({ role: 'assistant', content: replyText });
-
-                if (history.length > 20) {
-                    history = history.slice(-20);
-                }
+                if (history.length > 20) history = history.slice(-20);
                 await kv.set(dbKey, history);
 
-                await bot.sendMessage(chatId, telegramReply, { 
-                    parse_mode: 'Markdown' 
-                });
+                // --- NEW: SPLIT LONG MESSAGES ---
+                // Telegram max is 4096. We use 4000 to be safe.
+                const MAX_CHUNK_SIZE = 4000;
+                
+                if (telegramReply.length <= MAX_CHUNK_SIZE) {
+                    // Send normally if short enough
+                    await bot.sendMessage(chatId, telegramReply, { parse_mode: 'Markdown' });
+                } else {
+                    // Split into chunks if too long
+                    for (let i = 0; i < telegramReply.length; i += MAX_CHUNK_SIZE) {
+                        const chunk = telegramReply.substring(i, i + MAX_CHUNK_SIZE);
+                        try {
+                            // Try sending with Markdown
+                            await bot.sendMessage(chatId, chunk, { parse_mode: 'Markdown' });
+                        } catch (err) {
+                            // If Markdown fails (e.g. split in the middle of *bold*), send as plain text
+                            await bot.sendMessage(chatId, chunk);
+                        }
+                    }
+                }
 
             } catch (error) {
                 console.error("Chat Error:", error);
