@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { kv } = require('@vercel/kv');
 const { init } = require('@heyputer/puter.js/src/init.cjs');
 
-const puter = init(process.env.PUTER_AUTH_TOKEN);
+// Removed global 'init' to allow per-request token rotation
 
 export default async function handler(req, res) {
     const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN);
@@ -53,11 +53,25 @@ export default async function handler(req, res) {
 
                 history.push({ role: 'user', content: userMessage });
 
-                // --- SYSTEM PROMPT LOGIC ---
-                // We create a temporary copy of the messages to send to the AI.
-                // We add the System Prompt at the very beginning.
-                let messagesToSend = [...history];
+                // --- TOKEN ROTATION LOGIC ---
+                // 1. Get raw string and split by comma
+                const rawTokens = (process.env.PUTER_AUTH_TOKEN || '').split(',');
+                // 2. Clean up whitespace and remove empty entries
+                const tokens = rawTokens.map(t => t.trim()).filter(Boolean);
+
+                if (tokens.length === 0) {
+                    throw new Error("No PUTER_AUTH_TOKEN provided.");
+                }
+
+                // 3. Pick a random token
+                const selectedToken = tokens[Math.floor(Math.random() * tokens.length)];
                 
+                // 4. Initialize Puter with this specific token
+                const puter = init(selectedToken);
+
+
+                // --- SYSTEM PROMPT LOGIC ---
+                let messagesToSend = [...history];
                 if (process.env.SYSTEM_PROMPT) {
                     messagesToSend.unshift({ 
                         role: 'system', 
@@ -65,7 +79,7 @@ export default async function handler(req, res) {
                     });
                 }
 
-                // --- CALL AI ---
+                // --- CALL AI (Claude Opus 4.5) ---
                 const response = await puter.ai.chat(messagesToSend, {
                     model: 'claude-opus-4-5' 
                 });
