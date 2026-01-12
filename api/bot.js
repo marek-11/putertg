@@ -17,17 +17,14 @@ export default async function handler(req, res) {
             
             // --- WHITELIST CHECK ---
             const whitelistEnv = process.env.WHITELIST;
-            // Split by comma, trim whitespace, and ignore empty entries
             const allowedUsers = whitelistEnv 
                 ? whitelistEnv.split(',').map(id => id.trim()).filter(Boolean) 
                 : [];
 
-            // If user ID is NOT in the allowed list, block them.
-            // (If whitelistEnv is empty, allowedUsers is [], so everyone is blocked)
             if (!allowedUsers.includes(chatId.toString())) {
                 await bot.sendMessage(chatId, "You are unauthorized to use this bot.");
                 res.status(200).json({ status: 'unauthorized' });
-                return; // Stop execution here
+                return; 
             }
             // -----------------------
 
@@ -57,8 +54,9 @@ export default async function handler(req, res) {
 
                 history.push({ role: 'user', content: userMessage });
 
+                // SWITCHED TO CLAUDE HERE
                 const response = await puter.ai.chat(history, {
-                    model: 'gpt-5.2-chat-latest'
+                    model: 'claude-opus-4-5-20251101' // Changed from 'gpt-5-nano'
                 });
 
                 const replyText = typeof response === 'string' 
@@ -66,6 +64,7 @@ export default async function handler(req, res) {
                     : response.message?.content || JSON.stringify(response);
 
                 // --- MARKDOWN FIXES ---
+                // Claude handles Markdown well, but we still apply fixes for Telegram
                 let telegramReply = replyText
                     .replace(/\*\*(.*?)\*\*/g, '*$1*') // Bold
                     .replace(/__(.*?)__/g, '*$1*')     // Bold
@@ -86,7 +85,7 @@ export default async function handler(req, res) {
                 console.error("Chat Error:", error);
                 const fallbackText = typeof response !== 'undefined' 
                     ? (typeof response === 'string' ? response : response.message?.content)
-                    : "Sorry, I encountered an error.";
+                    : "Sorry, I encountered an error with the AI.";
                 await bot.sendMessage(chatId, fallbackText);
             }
         }
