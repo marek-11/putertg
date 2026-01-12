@@ -25,16 +25,15 @@ export default async function handler(req, res) {
                 return; 
             }
 
-            // --- HANDLE /START COMMAND ---
+            // --- COMMANDS ---
             if (userMessage === '/start') {
                 await bot.sendMessage(chatId, "Hi");
                 res.status(200).json({ status: 'ok' });
-                return; // Stop here, don't call AI
+                return;
             }
 
             const dbKey = `chat_history:${chatId}`;
 
-            // --- 1. HANDLE /CLEAR COMMAND ---
             if (userMessage === '/clear') {
                 try {
                     await kv.set(dbKey, []); 
@@ -47,7 +46,7 @@ export default async function handler(req, res) {
                 return; 
             }
 
-            // --- 2. HANDLE NORMAL CONVERSATION ---
+            // --- PROCESSING ---
             await bot.sendChatAction(chatId, 'typing');
 
             try {
@@ -99,29 +98,22 @@ export default async function handler(req, res) {
                     replyText = JSON.stringify(response);
                 }
 
-                // --- MARKDOWN FIXES ---
-                let telegramReply = replyText
-                    .replace(/\*\*(.*?)\*\*/g, '*$1*') 
-                    .replace(/__(.*?)__/g, '*$1*')     
-                    .replace(/^#{1,6}\s+(.*$)/gm, '*$1*'); 
-
+                // --- SAVE HISTORY ---
+                // We save the raw text exactly as the AI gave it
                 history.push({ role: 'assistant', content: replyText });
                 if (history.length > 20) history = history.slice(-20);
                 await kv.set(dbKey, history);
 
-                // --- SPLIT LONG MESSAGES ---
+                // --- SEND PLAIN TEXT (No Formatting) ---
+                // We removed the .replace() logic and the parse_mode: 'Markdown'
                 const MAX_CHUNK_SIZE = 4000;
                 
-                if (telegramReply.length <= MAX_CHUNK_SIZE) {
-                    await bot.sendMessage(chatId, telegramReply, { parse_mode: 'Markdown' });
+                if (replyText.length <= MAX_CHUNK_SIZE) {
+                    await bot.sendMessage(chatId, replyText);
                 } else {
-                    for (let i = 0; i < telegramReply.length; i += MAX_CHUNK_SIZE) {
-                        const chunk = telegramReply.substring(i, i + MAX_CHUNK_SIZE);
-                        try {
-                            await bot.sendMessage(chatId, chunk, { parse_mode: 'Markdown' });
-                        } catch (err) {
-                            await bot.sendMessage(chatId, chunk);
-                        }
+                    for (let i = 0; i < replyText.length; i += MAX_CHUNK_SIZE) {
+                        const chunk = replyText.substring(i, i + MAX_CHUNK_SIZE);
+                        await bot.sendMessage(chatId, chunk);
                     }
                 }
 
