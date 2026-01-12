@@ -26,7 +26,6 @@ export default async function handler(req, res) {
                 res.status(200).json({ status: 'unauthorized' });
                 return; 
             }
-            // -----------------------
 
             const dbKey = `chat_history:${chatId}`;
 
@@ -37,7 +36,7 @@ export default async function handler(req, res) {
                     await bot.sendMessage(chatId, "✅ Conversation history cleared.");
                 } catch (error) {
                     console.error("Clear Error:", error);
-                    await bot.sendMessage(chatId, "⚠️ Failed to clear memory.");
+                    await bot.sendMessage(chatId, `⚠️ Failed to clear memory: ${error.message}`);
                 }
                 res.status(200).json({ status: 'ok' });
                 return; 
@@ -54,9 +53,10 @@ export default async function handler(req, res) {
 
                 history.push({ role: 'user', content: userMessage });
 
-                // SWITCHED TO CLAUDE HERE
+                // ATTEMPT 1: Try 'claude-3.5-sonnet' (Common format)
+                // If this fails, the catch block will tell us why.
                 const response = await puter.ai.chat(history, {
-                    model: 'claude-3-5-sonnet' // Changed from 'gpt-5-nano'
+                    model: 'claude-3.5-sonnet' 
                 });
 
                 const replyText = typeof response === 'string' 
@@ -64,11 +64,10 @@ export default async function handler(req, res) {
                     : response.message?.content || JSON.stringify(response);
 
                 // --- MARKDOWN FIXES ---
-                // Claude handles Markdown well, but we still apply fixes for Telegram
                 let telegramReply = replyText
-                    .replace(/\*\*(.*?)\*\*/g, '*$1*') // Bold
-                    .replace(/__(.*?)__/g, '*$1*')     // Bold
-                    .replace(/^#{1,6}\s+(.*$)/gm, '*$1*'); // Headers
+                    .replace(/\*\*(.*?)\*\*/g, '*$1*') 
+                    .replace(/__(.*?)__/g, '*$1*')     
+                    .replace(/^#{1,6}\s+(.*$)/gm, '*$1*'); 
 
                 history.push({ role: 'assistant', content: replyText });
 
@@ -83,10 +82,8 @@ export default async function handler(req, res) {
 
             } catch (error) {
                 console.error("Chat Error:", error);
-                const fallbackText = typeof response !== 'undefined' 
-                    ? (typeof response === 'string' ? response : response.message?.content)
-                    : "Sorry, I encountered an error with the AI.";
-                await bot.sendMessage(chatId, fallbackText);
+                // SEND ACTUAL ERROR TO USER FOR DEBUGGING
+                await bot.sendMessage(chatId, `⚠️ AI Error: ${error.message || error.toString()}`);
             }
         }
 
