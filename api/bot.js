@@ -53,16 +53,34 @@ export default async function handler(req, res) {
 
                 history.push({ role: 'user', content: userMessage });
 
-                // SWITCHED TO CLAUDE OPUS 4.5
+                // --- CALL AI ---
                 const response = await puter.ai.chat(history, {
-                    model: 'claude-opus-4-5' // Verified model ID for Puter.js
+                    model: 'claude-opus-4-5' 
                 });
 
-                const replyText = typeof response === 'string' 
-                    ? response 
-                    : response.message?.content || JSON.stringify(response);
+                // --- SAFETY CHECKS (Fixes the crash) ---
+                if (!response) {
+                    throw new Error("AI Service returned an empty response.");
+                }
+
+                // Determine the text content safely
+                let replyText;
+                if (typeof response === 'string') {
+                    replyText = response;
+                } else if (response.message && response.message.content) {
+                    replyText = response.message.content;
+                } else {
+                    // If it's an object but not the expected format, confirm it's valid JSON
+                    replyText = JSON.stringify(response);
+                }
+
+                // Final check to ensure we have a string before .replace()
+                if (typeof replyText !== 'string') {
+                    replyText = "⚠️ Error: AI response was not text.";
+                }
 
                 // --- MARKDOWN FIXES ---
+                // Only run replace if we actually have a valid string
                 let telegramReply = replyText
                     .replace(/\*\*(.*?)\*\*/g, '*$1*') 
                     .replace(/__(.*?)__/g, '*$1*')     
