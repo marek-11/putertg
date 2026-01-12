@@ -14,6 +14,23 @@ export default async function handler(req, res) {
         if (body.message && body.message.text) {
             const chatId = body.message.chat.id;
             const userMessage = body.message.text.trim();
+            
+            // --- WHITELIST CHECK ---
+            const whitelistEnv = process.env.WHITELIST;
+            // Split by comma, trim whitespace, and ignore empty entries
+            const allowedUsers = whitelistEnv 
+                ? whitelistEnv.split(',').map(id => id.trim()).filter(Boolean) 
+                : [];
+
+            // If user ID is NOT in the allowed list, block them.
+            // (If whitelistEnv is empty, allowedUsers is [], so everyone is blocked)
+            if (!allowedUsers.includes(chatId.toString())) {
+                await bot.sendMessage(chatId, "You are unauthorized to use this bot.");
+                res.status(200).json({ status: 'unauthorized' });
+                return; // Stop execution here
+            }
+            // -----------------------
+
             const dbKey = `chat_history:${chatId}`;
 
             // --- 1. HANDLE /CLEAR COMMAND ---
@@ -33,7 +50,6 @@ export default async function handler(req, res) {
             await bot.sendChatAction(chatId, 'typing');
 
             try {
-                // Fetch history
                 let history = await kv.get(dbKey);
                 if (!Array.isArray(history)) {
                     history = [];
@@ -42,7 +58,7 @@ export default async function handler(req, res) {
                 history.push({ role: 'user', content: userMessage });
 
                 const response = await puter.ai.chat(history, {
-                    model: 'gpt-5.2-chat-latest'
+                    model: 'gpt-5-nano'
                 });
 
                 const replyText = typeof response === 'string' 
@@ -51,15 +67,10 @@ export default async function handler(req, res) {
 
                 // --- MARKDOWN FIXES ---
                 let telegramReply = replyText
-                    // 1. Convert **bold** to *bold*
-                    .replace(/\*\*(.*?)\*\*/g, '*$1*')
-                    // 2. Convert __bold__ to *bold*
-                    .replace(/__(.*?)__/g, '*$1*')
-                    // 3. Convert ANY Header (# through ######) to *Bold*
-                    // This fixes the ### issue you saw
-                    .replace(/^#{1,6}\s+(.*$)/gm, '*$1*');
+                    .replace(/\*\*(.*?)\*\*/g, '*$1*') // Bold
+                    .replace(/__(.*?)__/g, '*$1*')     // Bold
+                    .replace(/^#{1,6}\s+(.*$)/gm, '*$1*'); // Headers
 
-                // Save ORIGINAL text to history (so AI context stays clean)
                 history.push({ role: 'assistant', content: replyText });
 
                 if (history.length > 20) {
@@ -67,20 +78,15 @@ export default async function handler(req, res) {
                 }
                 await kv.set(dbKey, history);
 
-                // Send with Markdown parsing
                 await bot.sendMessage(chatId, telegramReply, { 
                     parse_mode: 'Markdown' 
                 });
 
             } catch (error) {
                 console.error("Chat Error:", error);
-                
-                // FALLBACK: If Markdown fails (e.g. unclosed *), send plain text
-                // This ensures you still get the answer even if formatting breaks
                 const fallbackText = typeof response !== 'undefined' 
                     ? (typeof response === 'string' ? response : response.message?.content)
                     : "Sorry, I encountered an error.";
-                    
                 await bot.sendMessage(chatId, fallbackText);
             }
         }
