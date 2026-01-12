@@ -45,7 +45,7 @@ export default async function handler(req, res) {
 
                 // Get AI response
                 const response = await puter.ai.chat(history, {
-                    model: 'gpt-5-nano'
+                    model: 'claude-opus-4-5-20251101'
                 });
 
                 const replyText = typeof response === 'string' 
