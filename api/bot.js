@@ -4,40 +4,32 @@ const { kv } = require('@vercel/kv');
 const { init } = require('@heyputer/puter.js/src/init.cjs');
 
 // --- HELPER: TAVILY RESEARCHER ---
-// This function is ONLY called when the user types /s
 async function performTavilyResearch(userQuery) {
-    // Check for the new TAVILY_API_KEY
     if (!process.env.TAVILY_API_KEY) return null;
 
     try {
         const response = await fetch("https://api.tavily.com/search", {
             method: "POST",
-            headers: {
-                "Content-Type": "application/json"
-            },
+            headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
                 api_key: process.env.TAVILY_API_KEY,
                 query: userQuery,
-                search_depth: "basic",      // "basic" is faster, "advanced" is deeper
-                include_answer: true,       // Ask Tavily to generate a short answer too
-                max_results: 5              // Get top 5 results
+                search_depth: "basic",
+                include_answer: true,
+                max_results: 5
             })
         });
 
-        if (!response.ok) {
-            throw new Error(`Tavily API Error: ${response.statusText}`);
-        }
+        if (!response.ok) throw new Error(`Tavily API Error: ${response.statusText}`);
 
         const data = await response.json();
         
-        // Format the results nicely for Claude to read
         let context = `Tavily AI Answer: ${data.answer}\n\nSources Found:\n`;
         if (data.results && data.results.length > 0) {
             data.results.forEach((result, index) => {
                 context += `[${index + 1}] Title: ${result.title}\n    URL: ${result.url}\n    Content: ${result.content}\n\n`;
             });
         }
-        
         return context;
 
     } catch (error) {
@@ -81,7 +73,6 @@ export default async function handler(req, res) {
                     await kv.set(dbKey, []); 
                     await bot.sendMessage(chatId, "✅ Conversation history cleared.");
                 } catch (error) {
-                    console.error("Clear Error:", error);
                     await bot.sendMessage(chatId, `⚠️ Failed to clear memory: ${error.message}`);
                 }
                 res.status(200).json({ status: 'ok' });
@@ -92,40 +83,27 @@ export default async function handler(req, res) {
 
             try {
                 let history = await kv.get(dbKey);
-                if (!Array.isArray(history)) {
-                    history = [];
-                }
+                if (!Array.isArray(history)) history = [];
 
-                // ====================================================
-                // STRICT SEARCH LOGIC (/s ONLY) - UPDATED FOR TAVILY
-                // ====================================================
+                // --- SEARCH LOGIC ---
                 let messageContent = userMessage;
                 let searchContext = null;
 
-                // STRICT CHECK: Does it start with "/s "?
                 if (userMessage.startsWith('/s ')) {
-                    const query = userMessage.slice(3).trim(); // Remove "/s "
-                    
+                    const query = userMessage.slice(3).trim();
                     if (query.length > 0) {
-                        // 1. Update the content we save to history
                         messageContent = query;
-
                         await bot.sendChatAction(chatId, 'typing'); 
-                        
-                        // 2. FORCE SEARCH (Using Tavily now)
                         const researchResults = await performTavilyResearch(query);
-                        
                         if (researchResults) {
                             searchContext = `\n\n[SYSTEM: The user explicitly requested a web search. Here are the Tavily results for "${query}":\n${researchResults}\n\nUse these facts to answer the user.]`;
                         }
                     }
                 }
-                // ====================================================
 
-                // Save user message to history
                 history.push({ role: 'user', content: messageContent });
 
-                // --- PREPARE PUTHER TOKENS ---
+                // --- TOKEN PREPARATION ---
                 const rawTokensString = process.env.PUTER_AUTH_TOKEN;
                 if (!rawTokensString) throw new Error("No PUTER_AUTH_TOKEN found.");
                 
@@ -138,10 +116,8 @@ export default async function handler(req, res) {
                     [tokens[i], tokens[j]] = [tokens[j], tokens[i]];
                 }
 
-                // --- PREPARE MESSAGES FOR CLAUDE ---
+                // --- MESSAGE PREPARATION ---
                 let messagesToSend = [...history];
-
-                // Inject Search Context into the LAST message if we searched
                 if (searchContext) {
                     const lastMsgIndex = messagesToSend.length - 1;
                     if (lastMsgIndex >= 0) {
@@ -151,26 +127,54 @@ export default async function handler(req, res) {
                         };
                     }
                 }
-
                 if (process.env.SYSTEM_PROMPT) {
                     messagesToSend.unshift({ role: 'system', content: process.env.SYSTEM_PROMPT });
                 }
 
-                // --- WRITER PHASE (Claude Opus) ---
+                // --- ROTATION LOOP (FIXED) ---
                 let response = null;
                 let lastError = null;
 
-                // Loop through tokens until one works
                 for (const token of tokens) {
                     try {
                         const puter = init(token);
-                        response = await puter.ai.chat(messagesToSend, {
+                        
+                        // We await the response
+                        const result = await puter.ai.chat(messagesToSend, {
                             model: 'claude-opus-4-5' 
                         });
-                        break; 
+
+                        // 1. Check for hard failure (null/undefined)
+                        if (!result) throw new Error("API returned empty response");
+
+                        // 2. Check for explicit error objects (Some APIs return {error: '...'} instead of throwing)
+                        if (result.error || result.code) {
+                            throw new Error(JSON.stringify(result));
+                        }
+
+                        // 3. Check text content for credit warnings
+                        // Sometimes the API returns a string saying "Out of credits"
+                        let tempText = "";
+                        if (typeof result === 'string') tempText = result;
+                        else if (result?.message?.content) tempText = result.message.content;
+                        
+                        // If the response is suspiciously short and mentions 'credit' or 'quota', treat as error
+                        // This forces the loop to try the next token
+                        if (typeof tempText === 'string' && tempText.length < 100) {
+                            const lower = tempText.toLowerCase();
+                            if (lower.includes('credit') || lower.includes('quota') || lower.includes('insufficient')) {
+                                throw new Error(`Token returned error text: ${tempText}`);
+                            }
+                        }
+
+                        // If we passed all checks, accept this response
+                        response = result;
+                        break; // SUCCESS! Exit the loop.
+
                     } catch (err) {
-                        console.warn(`Token failed: ${err.message}`);
+                        console.warn(`Token ending in ...${token.slice(-4)} failed: ${err.message}`);
                         lastError = err;
+                        // LOOP CONTINUES TO NEXT TOKEN AUTOMATICALLY
                     }
                 }
 
@@ -214,15 +218,13 @@ export default async function handler(req, res) {
                 if (history.length > 20) history = history.slice(-20);
                 await kv.set(dbKey, history);
 
-                // --- SEND PLAIN TEXT ---
+                // --- SEND RESPONSE ---
                 const MAX_CHUNK_SIZE = 4000;
-                
                 if (cleanReply.length <= MAX_CHUNK_SIZE) {
                     await bot.sendMessage(chatId, cleanReply);
                 } else {
                     for (let i = 0; i < cleanReply.length; i += MAX_CHUNK_SIZE) {
-                        const chunk = cleanReply.substring(i, i + MAX_CHUNK_SIZE);
-                        await bot.sendMessage(chatId, chunk);
+                        await bot.sendMessage(chatId, cleanReply.substring(i, i + MAX_CHUNK_SIZE));
                     }
                 }
 
