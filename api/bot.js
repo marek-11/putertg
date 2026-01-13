@@ -3,6 +3,73 @@ const TelegramBot = require('node-telegram-bot-api');
 const { kv } = require('@vercel/kv');
 const { init } = require('@heyputer/puter.js/src/init.cjs');
 
+// --- HELPER 1: CLASSIFIER (Decides IF we need to search) ---
+// Uses a super-fast, cheap model just to say "YES" or "NO"
+async function shouldWeSearch(userMessage) {
+    if (!process.env.GROQ_API_KEY) return false;
+
+    try {
+        const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+            method: "POST",
+            headers: {
+                "Authorization": `Bearer ${process.env.GROQ_API_KEY}`,
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+                model: "llama-3.1-8b-instant", // Very fast classifier
+                messages: [
+                    {
+                        role: "system",
+                        content: "You are a classifier. Does the user's message require looking up real-time info (news, weather, stocks, facts not in training data)? Output only 'YES' or 'NO'."
+                    },
+                    { role: "user", content: userMessage }
+                ],
+                temperature: 0,
+                max_tokens: 10
+            })
+        });
+
+        const data = await response.json();
+        const decision = data.choices?.[0]?.message?.content?.trim().toUpperCase();
+        return decision?.includes("YES");
+    } catch (error) {
+        console.error("Classifier Error:", error);
+        return false;
+    }
+}
+
+// --- HELPER 2: RESEARCHER (Uses Groq Compound Mini) ---
+// This model has built-in web search. We ask it to find the info.
+async function performGroqResearch(userMessage) {
+    if (!process.env.GROQ_API_KEY) return null;
+
+    try {
+        const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+            method: "POST",
+            headers: {
+                "Authorization": `Bearer ${process.env.GROQ_API_KEY}`,
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+                model: "groq/compound-mini", // <--- THE MODEL WITH BUILT-IN WEB TOOLS
+                messages: [
+                    {
+                        role: "system",
+                        content: "You are a research assistant. Search the web for the user's query and provide a detailed factual summary. Do not try to be conversational, just list the facts found."
+                    },
+                    { role: "user", content: userMessage }
+                ]
+            })
+        });
+
+        const data = await response.json();
+        return data.choices?.[0]?.message?.content || null;
+    } catch (error) {
+        console.error("Groq Research Error:", error);
+        return null;
+    }
+}
+
 export default async function handler(req, res) {
     const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN);
 
@@ -55,56 +122,80 @@ export default async function handler(req, res) {
 
                 history.push({ role: 'user', content: userMessage });
 
-                // --- 1. PREPARE TOKENS ---
+                // ====================================================
+                // RESEARCH PHASE (Groq)
+                // ====================================================
+                let searchContext = null;
+                
+                // 1. Check if we need to search
+                const needsSearch = await shouldWeSearch(userMessage);
+
+                if (needsSearch) {
+                    await bot.sendChatAction(chatId, 'typing'); // Keep typing indicator active
+                    
+                    // 2. Perform Research using Compound Mini
+                    const researchResults = await performGroqResearch(userMessage);
+                    
+                    if (researchResults) {
+                        // We wrap the results in a system block for Claude
+                        searchContext = `\n\n[SYSTEM: I have researched the web for you. Here is the latest information found:\n${researchResults}\n\nUse these facts to answer the user's question.]`;
+                    }
+                }
+                // ====================================================
+
+                // --- PREPARE TOKEN ---
                 const rawTokensString = process.env.PUTER_AUTH_TOKEN;
                 if (!rawTokensString) throw new Error("No PUTER_AUTH_TOKEN found.");
                 
-                // Split and Clean
                 let tokens = rawTokensString.split(',').map(t => t.trim()).filter(Boolean);
                 if (tokens.length === 0) throw new Error("PUTER_AUTH_TOKEN is empty.");
 
-                // Shuffle the tokens (Fisher-Yates Shuffle)
-                // This ensures we don't always try them in the exact same order, spreading the load.
+                // Shuffle tokens
                 for (let i = tokens.length - 1; i > 0; i--) {
                     const j = Math.floor(Math.random() * (i + 1));
                     [tokens[i], tokens[j]] = [tokens[j], tokens[i]];
                 }
 
-                // --- 2. PREPARE MESSAGES ---
+                // --- PREPARE MESSAGES ---
                 let messagesToSend = [...history];
+
+                // Inject Search Context into the LAST user message if it exists
+                if (searchContext) {
+                    const lastMsgIndex = messagesToSend.length - 1;
+                    if (lastMsgIndex >= 0) {
+                        messagesToSend[lastMsgIndex] = {
+                            role: 'user',
+                            content: messagesToSend[lastMsgIndex].content + searchContext
+                        };
+                    }
+                }
+
                 if (process.env.SYSTEM_PROMPT) {
                     messagesToSend.unshift({ role: 'system', content: process.env.SYSTEM_PROMPT });
                 }
 
-                // --- 3. TRY TOKENS LOOP (The Fix) ---
+                // --- WRITER PHASE (Claude Opus) ---
                 let response = null;
                 let lastError = null;
 
                 for (const token of tokens) {
                     try {
-                        // Initialize with current token
                         const puter = init(token);
-                        
-                        // Try the request
                         response = await puter.ai.chat(messagesToSend, {
                             model: 'claude-opus-4-5' 
                         });
-
-                        // If we get here, it succeeded! Break the loop.
                         break; 
                     } catch (err) {
-                        console.warn(`Token ending in ...${token.slice(-4)} failed. trying next. Error: ${err.message}`);
+                        console.warn(`Token failed: ${err.message}`);
                         lastError = err;
-                        // The loop continues to the next token automatically
                     }
                 }
 
-                // If response is still null after checking ALL tokens, then we really failed.
                 if (!response) {
-                    throw new Error(`All ${tokens.length} tokens failed. Last error: ${lastError?.message}`);
+                    throw new Error(`All tokens failed. Last error: ${lastError?.message}`);
                 }
 
-                // --- 4. PROCESSING RESPONSE ---
+                // --- PARSE RESPONSE ---
                 let replyText = '';
                 if (typeof response === 'string') {
                     replyText = response;
