@@ -3,53 +3,11 @@ const TelegramBot = require('node-telegram-bot-api');
 const { kv } = require('@vercel/kv');
 const { init } = require('@heyputer/puter.js/src/init.cjs');
 
-// --- HELPER 1: CLASSIFIER (Decides IF we need to search) ---
-// UPGRADE: Switched to 'llama-3.3-70b-versatile' which is smarter and follows instructions better.
-async function shouldWeSearch(userMessage) {
-    if (!process.env.GROQ_API_KEY) {
-        console.log("🚫 No GROQ_API_KEY found. Skipping search.");
-        return false;
-    }
-
-    try {
-        const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-            method: "POST",
-            headers: {
-                "Authorization": `Bearer ${process.env.GROQ_API_KEY}`,
-                "Content-Type": "application/json"
-            },
-            body: JSON.stringify({
-                model: "llama-3.3-70b-versatile", // Smarter model for better decisions
-                messages: [
-                    {
-                        role: "system",
-                        content: "You are a decision engine. Determine if the user's query requires real-world facts, data, news, or knowledge that might have changed recently. \n\nRULES:\n- IF asking about people, places, events, stocks, prices, or specific facts: output 'YES'.\n- IF asking for code, creative writing, translation, or simple greetings: output 'NO'.\n- Output ONLY 'YES' or 'NO'."
-                    },
-                    { role: "user", content: userMessage }
-                ],
-                temperature: 0,
-                max_tokens: 5
-            })
-        });
-
-        const data = await response.json();
-        const rawDecision = data.choices?.[0]?.message?.content?.trim().toUpperCase() || "NO";
-        
-        console.log(`🔍 Classifier Decision for "${userMessage}": ${rawDecision}`); // <--- DEBUG LOG
-        
-        return rawDecision.includes("YES");
-    } catch (error) {
-        console.error("❌ Classifier Error:", error);
-        return false;
-    }
-}
-
-// --- HELPER 2: RESEARCHER ---
+// --- HELPER: RESEARCHER (Uses Groq Compound Mini) ---
 async function performGroqResearch(userMessage) {
     if (!process.env.GROQ_API_KEY) return null;
 
     try {
-        console.log("🌐 Starting Research...");
         const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
             method: "POST",
             headers: {
@@ -57,11 +15,11 @@ async function performGroqResearch(userMessage) {
                 "Content-Type": "application/json"
             },
             body: JSON.stringify({
-                model: "groq/compound", 
+                model: "groq/compound-mini", 
                 messages: [
                     {
                         role: "system",
-                        content: "You are a research tool. Perform a web search if needed and return a concise, factual summary of the user's query. If the query is unclear, provide the most likely relevant facts."
+                        content: "You are a research assistant. Search the web for the user's query and provide a detailed factual summary. Do not try to be conversational, just list the facts found."
                     },
                     { role: "user", content: userMessage }
                 ]
@@ -69,18 +27,9 @@ async function performGroqResearch(userMessage) {
         });
 
         const data = await response.json();
-        
-        // Check if the model actually returned content or an error
-        if (data.error) {
-            console.error("❌ Research Model Error:", data.error);
-            return null;
-        }
-
-        const content = data.choices?.[0]?.message?.content;
-        console.log("✅ Research Complete. Length:", content ? content.length : 0);
-        return content || null;
+        return data.choices?.[0]?.message?.content || null;
     } catch (error) {
-        console.error("❌ Research Network Error:", error);
+        console.error("Groq Research Error:", error);
         return null;
     }
 }
@@ -135,31 +84,37 @@ export default async function handler(req, res) {
                     history = [];
                 }
 
-                history.push({ role: 'user', content: userMessage });
-
                 // ====================================================
-                // RESEARCH PHASE
+                // MANUAL SEARCH LOGIC (/s command)
                 // ====================================================
+                let messageContent = userMessage; // Default: use the text as is
                 let searchContext = null;
-                
-                // 1. Check Classifier
-                const needsSearch = await shouldWeSearch(userMessage);
 
-                if (needsSearch) {
-                    await bot.sendChatAction(chatId, 'typing');
+                // Check if message starts with "/s " (e.g. "/s price of btc")
+                if (userMessage.startsWith('/s ')) {
+                    const query = userMessage.slice(3).trim(); // Remove "/s "
                     
-                    // 2. Perform Research
-                    const researchResults = await performGroqResearch(userMessage);
-                    
-                    if (researchResults) {
-                        searchContext = `\n\n[SYSTEM: Web Search Results for "${userMessage}":\n${researchResults}\n\nUse these facts to answer.]`;
-                    } else {
-                        console.log("⚠️ Research returned no data. Falling back to Claude Opus directly.");
+                    if (query.length > 0) {
+                        // Update messageContent so history saves "price of btc" instead of "/s price of btc"
+                        // This helps Claude understand the context better in future turns.
+                        messageContent = query;
+
+                        await bot.sendChatAction(chatId, 'typing'); 
+                        
+                        // Perform Research
+                        const researchResults = await performGroqResearch(query);
+                        
+                        if (researchResults) {
+                            searchContext = `\n\n[SYSTEM: I have researched the web for you. Here is the latest information found:\n${researchResults}\n\nUse these facts to answer the user's question.]`;
+                        }
                     }
                 }
                 // ====================================================
 
-                // --- PREPARE TOKENS ---
+                // Save the (potentially cleaned) message to history
+                history.push({ role: 'user', content: messageContent });
+
+                // --- PREPARE TOKEN ---
                 const rawTokensString = process.env.PUTER_AUTH_TOKEN;
                 if (!rawTokensString) throw new Error("No PUTER_AUTH_TOKEN found.");
                 
@@ -175,7 +130,7 @@ export default async function handler(req, res) {
                 // --- PREPARE MESSAGES ---
                 let messagesToSend = [...history];
 
-                // Inject Search Context if available
+                // Inject Search Context into the LAST user message if it exists
                 if (searchContext) {
                     const lastMsgIndex = messagesToSend.length - 1;
                     if (lastMsgIndex >= 0) {
