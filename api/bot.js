@@ -3,8 +3,9 @@ const TelegramBot = require('node-telegram-bot-api');
 const { kv } = require('@vercel/kv');
 const { init } = require('@heyputer/puter.js/src/init.cjs');
 
-// --- HELPER: RESEARCHER (Uses Groq Compound Mini) ---
-async function performGroqResearch(userMessage) {
+// --- HELPER: RESEARCHER ---
+// This function is ONLY called when the user types /s
+async function performGroqResearch(userQuery) {
     if (!process.env.GROQ_API_KEY) return null;
 
     try {
@@ -15,13 +16,13 @@ async function performGroqResearch(userMessage) {
                 "Content-Type": "application/json"
             },
             body: JSON.stringify({
-                model: "groq/compound-mini", 
+                model: "groq/compound-mini", // The model you specified with web capability
                 messages: [
                     {
                         role: "system",
-                        content: "You are a research assistant. Search the web for the user's query and provide a detailed factual summary. Do not try to be conversational, just list the facts found."
+                        content: "You are a research tool. Search the web for the user's query and output a strictly factual summary of findings. Do not offer advice, just facts."
                     },
-                    { role: "user", content: userMessage }
+                    { role: "user", content: userQuery }
                 ]
             })
         });
@@ -30,7 +31,7 @@ async function performGroqResearch(userMessage) {
         return data.choices?.[0]?.message?.content || null;
     } catch (error) {
         console.error("Groq Research Error:", error);
-        return null;
+        return `[Error fetching search results: ${error.message}]`;
     }
 }
 
@@ -85,36 +86,35 @@ export default async function handler(req, res) {
                 }
 
                 // ====================================================
-                // MANUAL SEARCH LOGIC (/s command)
+                // STRICT SEARCH LOGIC (/s ONLY)
                 // ====================================================
-                let messageContent = userMessage; // Default: use the text as is
+                let messageContent = userMessage;
                 let searchContext = null;
 
-                // Check if message starts with "/s " (e.g. "/s price of btc")
+                // STRICT CHECK: Does it start with "/s "?
                 if (userMessage.startsWith('/s ')) {
                     const query = userMessage.slice(3).trim(); // Remove "/s "
                     
                     if (query.length > 0) {
-                        // Update messageContent so history saves "price of btc" instead of "/s price of btc"
-                        // This helps Claude understand the context better in future turns.
+                        // 1. Update the content we save to history (remove the /s command for cleanliness)
                         messageContent = query;
 
                         await bot.sendChatAction(chatId, 'typing'); 
                         
-                        // Perform Research
+                        // 2. FORCE SEARCH (No classifier, no checks, just do it)
                         const researchResults = await performGroqResearch(query);
                         
                         if (researchResults) {
-                            searchContext = `\n\n[SYSTEM: I have researched the web for you. Here is the latest information found:\n${researchResults}\n\nUse these facts to answer the user's question.]`;
+                            searchContext = `\n\n[SYSTEM: The user explicitly requested a web search. Here are the results for "${query}":\n${researchResults}\n\nUse these facts to answer the user.]`;
                         }
                     }
                 }
                 // ====================================================
 
-                // Save the (potentially cleaned) message to history
+                // Save user message to history
                 history.push({ role: 'user', content: messageContent });
 
-                // --- PREPARE TOKEN ---
+                // --- PREPARE PUTHER TOKENS ---
                 const rawTokensString = process.env.PUTER_AUTH_TOKEN;
                 if (!rawTokensString) throw new Error("No PUTER_AUTH_TOKEN found.");
                 
@@ -127,10 +127,10 @@ export default async function handler(req, res) {
                     [tokens[i], tokens[j]] = [tokens[j], tokens[i]];
                 }
 
-                // --- PREPARE MESSAGES ---
+                // --- PREPARE MESSAGES FOR CLAUDE ---
                 let messagesToSend = [...history];
 
-                // Inject Search Context into the LAST user message if it exists
+                // Inject Search Context into the LAST message if we searched
                 if (searchContext) {
                     const lastMsgIndex = messagesToSend.length - 1;
                     if (lastMsgIndex >= 0) {
@@ -149,6 +149,7 @@ export default async function handler(req, res) {
                 let response = null;
                 let lastError = null;
 
+                // Loop through tokens until one works
                 for (const token of tokens) {
                     try {
                         const puter = init(token);
