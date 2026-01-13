@@ -3,34 +3,45 @@ const TelegramBot = require('node-telegram-bot-api');
 const { kv } = require('@vercel/kv');
 const { init } = require('@heyputer/puter.js/src/init.cjs');
 
-// --- HELPER: RESEARCHER ---
+// --- HELPER: TAVILY RESEARCHER ---
 // This function is ONLY called when the user types /s
-async function performGroqResearch(userQuery) {
-    if (!process.env.GROQ_API_KEY) return null;
+async function performTavilyResearch(userQuery) {
+    // Check for the new TAVILY_API_KEY
+    if (!process.env.TAVILY_API_KEY) return null;
 
     try {
-        const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+        const response = await fetch("https://api.tavily.com/search", {
             method: "POST",
             headers: {
-                "Authorization": `Bearer ${process.env.GROQ_API_KEY}`,
                 "Content-Type": "application/json"
             },
             body: JSON.stringify({
-                model: "groq/compound-mini", // The model you specified with web capability
-                messages: [
-                    {
-                        role: "system",
-                        content: "You are a research tool. Search the web for the user's query and output a strictly factual summary of findings. Do not offer advice, just facts."
-                    },
-                    { role: "user", content: userQuery }
-                ]
+                api_key: process.env.TAVILY_API_KEY,
+                query: userQuery,
+                search_depth: "basic",      // "basic" is faster, "advanced" is deeper
+                include_answer: true,       // Ask Tavily to generate a short answer too
+                max_results: 5              // Get top 5 results
             })
         });
 
+        if (!response.ok) {
+            throw new Error(`Tavily API Error: ${response.statusText}`);
+        }
+
         const data = await response.json();
-        return data.choices?.[0]?.message?.content || null;
+        
+        // Format the results nicely for Claude to read
+        let context = `Tavily AI Answer: ${data.answer}\n\nSources Found:\n`;
+        if (data.results && data.results.length > 0) {
+            data.results.forEach((result, index) => {
+                context += `[${index + 1}] Title: ${result.title}\n    URL: ${result.url}\n    Content: ${result.content}\n\n`;
+            });
+        }
+        
+        return context;
+
     } catch (error) {
-        console.error("Groq Research Error:", error);
+        console.error("Tavily Research Error:", error);
         return `[Error fetching search results: ${error.message}]`;
     }
 }
@@ -86,7 +97,7 @@ export default async function handler(req, res) {
                 }
 
                 // ====================================================
-                // STRICT SEARCH LOGIC (/s ONLY)
+                // STRICT SEARCH LOGIC (/s ONLY) - UPDATED FOR TAVILY
                 // ====================================================
                 let messageContent = userMessage;
                 let searchContext = null;
@@ -96,16 +107,16 @@ export default async function handler(req, res) {
                     const query = userMessage.slice(3).trim(); // Remove "/s "
                     
                     if (query.length > 0) {
-                        // 1. Update the content we save to history (remove the /s command for cleanliness)
+                        // 1. Update the content we save to history
                         messageContent = query;
 
                         await bot.sendChatAction(chatId, 'typing'); 
                         
-                        // 2. FORCE SEARCH (No classifier, no checks, just do it)
-                        const researchResults = await performGroqResearch(query);
+                        // 2. FORCE SEARCH (Using Tavily now)
+                        const researchResults = await performTavilyResearch(query);
                         
                         if (researchResults) {
-                            searchContext = `\n\n[SYSTEM: The user explicitly requested a web search. Here are the results for "${query}":\n${researchResults}\n\nUse these facts to answer the user.]`;
+                            searchContext = `\n\n[SYSTEM: The user explicitly requested a web search. Here are the Tavily results for "${query}":\n${researchResults}\n\nUse these facts to answer the user.]`;
                         }
                     }
                 }
