@@ -4,9 +4,12 @@ const { kv } = require('@vercel/kv');
 const { init } = require('@heyputer/puter.js/src/init.cjs');
 
 // --- HELPER 1: CLASSIFIER (Decides IF we need to search) ---
-// Uses a super-fast, cheap model just to say "YES" or "NO"
+// UPGRADE: Switched to 'llama-3.3-70b-versatile' which is smarter and follows instructions better.
 async function shouldWeSearch(userMessage) {
-    if (!process.env.GROQ_API_KEY) return false;
+    if (!process.env.GROQ_API_KEY) {
+        console.log("🚫 No GROQ_API_KEY found. Skipping search.");
+        return false;
+    }
 
     try {
         const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
@@ -16,34 +19,37 @@ async function shouldWeSearch(userMessage) {
                 "Content-Type": "application/json"
             },
             body: JSON.stringify({
-                model: "llama-3.1-8b-instant", // Very fast classifier
+                model: "llama-3.3-70b-versatile", // Smarter model for better decisions
                 messages: [
                     {
                         role: "system",
-                        content: "You are a classifier. Does the user's message require looking up real-time info (news, weather, stocks, facts not in training data)? Output only 'YES' or 'NO'."
+                        content: "You are a decision engine. Determine if the user's query requires real-world facts, data, news, or knowledge that might have changed recently. \n\nRULES:\n- IF asking about people, places, events, stocks, prices, or specific facts: output 'YES'.\n- IF asking for code, creative writing, translation, or simple greetings: output 'NO'.\n- Output ONLY 'YES' or 'NO'."
                     },
                     { role: "user", content: userMessage }
                 ],
                 temperature: 0,
-                max_tokens: 10
+                max_tokens: 5
             })
         });
 
         const data = await response.json();
-        const decision = data.choices?.[0]?.message?.content?.trim().toUpperCase();
-        return decision?.includes("YES");
+        const rawDecision = data.choices?.[0]?.message?.content?.trim().toUpperCase() || "NO";
+        
+        console.log(`🔍 Classifier Decision for "${userMessage}": ${rawDecision}`); // <--- DEBUG LOG
+        
+        return rawDecision.includes("YES");
     } catch (error) {
-        console.error("Classifier Error:", error);
+        console.error("❌ Classifier Error:", error);
         return false;
     }
 }
 
-// --- HELPER 2: RESEARCHER (Uses Groq Compound Mini) ---
-// This model has built-in web search. We ask it to find the info.
+// --- HELPER 2: RESEARCHER ---
 async function performGroqResearch(userMessage) {
     if (!process.env.GROQ_API_KEY) return null;
 
     try {
+        console.log("🌐 Starting Research...");
         const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
             method: "POST",
             headers: {
@@ -51,11 +57,11 @@ async function performGroqResearch(userMessage) {
                 "Content-Type": "application/json"
             },
             body: JSON.stringify({
-                model: "groq/compound-mini", // <--- THE MODEL WITH BUILT-IN WEB TOOLS
+                model: "groq/compound", 
                 messages: [
                     {
                         role: "system",
-                        content: "You are a research assistant. Search the web for the user's query and provide a detailed factual summary. Do not try to be conversational, just list the facts found."
+                        content: "You are a research tool. Perform a web search if needed and return a concise, factual summary of the user's query. If the query is unclear, provide the most likely relevant facts."
                     },
                     { role: "user", content: userMessage }
                 ]
@@ -63,9 +69,18 @@ async function performGroqResearch(userMessage) {
         });
 
         const data = await response.json();
-        return data.choices?.[0]?.message?.content || null;
+        
+        // Check if the model actually returned content or an error
+        if (data.error) {
+            console.error("❌ Research Model Error:", data.error);
+            return null;
+        }
+
+        const content = data.choices?.[0]?.message?.content;
+        console.log("✅ Research Complete. Length:", content ? content.length : 0);
+        return content || null;
     } catch (error) {
-        console.error("Groq Research Error:", error);
+        console.error("❌ Research Network Error:", error);
         return null;
     }
 }
@@ -123,27 +138,28 @@ export default async function handler(req, res) {
                 history.push({ role: 'user', content: userMessage });
 
                 // ====================================================
-                // RESEARCH PHASE (Groq)
+                // RESEARCH PHASE
                 // ====================================================
                 let searchContext = null;
                 
-                // 1. Check if we need to search
+                // 1. Check Classifier
                 const needsSearch = await shouldWeSearch(userMessage);
 
                 if (needsSearch) {
-                    await bot.sendChatAction(chatId, 'typing'); // Keep typing indicator active
+                    await bot.sendChatAction(chatId, 'typing');
                     
-                    // 2. Perform Research using Compound Mini
+                    // 2. Perform Research
                     const researchResults = await performGroqResearch(userMessage);
                     
                     if (researchResults) {
-                        // We wrap the results in a system block for Claude
-                        searchContext = `\n\n[SYSTEM: I have researched the web for you. Here is the latest information found:\n${researchResults}\n\nUse these facts to answer the user's question.]`;
+                        searchContext = `\n\n[SYSTEM: Web Search Results for "${userMessage}":\n${researchResults}\n\nUse these facts to answer.]`;
+                    } else {
+                        console.log("⚠️ Research returned no data. Falling back to Claude Opus directly.");
                     }
                 }
                 // ====================================================
 
-                // --- PREPARE TOKEN ---
+                // --- PREPARE TOKENS ---
                 const rawTokensString = process.env.PUTER_AUTH_TOKEN;
                 if (!rawTokensString) throw new Error("No PUTER_AUTH_TOKEN found.");
                 
@@ -159,7 +175,7 @@ export default async function handler(req, res) {
                 // --- PREPARE MESSAGES ---
                 let messagesToSend = [...history];
 
-                // Inject Search Context into the LAST user message if it exists
+                // Inject Search Context if available
                 if (searchContext) {
                     const lastMsgIndex = messagesToSend.length - 1;
                     if (lastMsgIndex >= 0) {
