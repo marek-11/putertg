@@ -55,25 +55,56 @@ export default async function handler(req, res) {
 
                 history.push({ role: 'user', content: userMessage });
 
+                // --- 1. PREPARE TOKENS ---
                 const rawTokensString = process.env.PUTER_AUTH_TOKEN;
                 if (!rawTokensString) throw new Error("No PUTER_AUTH_TOKEN found.");
                 
-                const tokens = rawTokensString.split(',').map(t => t.trim()).filter(Boolean);
+                // Split and Clean
+                let tokens = rawTokensString.split(',').map(t => t.trim()).filter(Boolean);
                 if (tokens.length === 0) throw new Error("PUTER_AUTH_TOKEN is empty.");
 
-                const selectedToken = tokens[Math.floor(Math.random() * tokens.length)];
-                const puter = init(selectedToken);
+                // Shuffle the tokens (Fisher-Yates Shuffle)
+                // This ensures we don't always try them in the exact same order, spreading the load.
+                for (let i = tokens.length - 1; i > 0; i--) {
+                    const j = Math.floor(Math.random() * (i + 1));
+                    [tokens[i], tokens[j]] = [tokens[j], tokens[i]];
+                }
 
-                // --- SYSTEM PROMPT ---
+                // --- 2. PREPARE MESSAGES ---
                 let messagesToSend = [...history];
                 if (process.env.SYSTEM_PROMPT) {
                     messagesToSend.unshift({ role: 'system', content: process.env.SYSTEM_PROMPT });
                 }
 
-                const response = await puter.ai.chat(messagesToSend, {
-                    model: 'claude-opus-4-5' 
-                });
+                // --- 3. TRY TOKENS LOOP (The Fix) ---
+                let response = null;
+                let lastError = null;
 
+                for (const token of tokens) {
+                    try {
+                        // Initialize with current token
+                        const puter = init(token);
+                        
+                        // Try the request
+                        response = await puter.ai.chat(messagesToSend, {
+                            model: 'claude-opus-4-5' 
+                        });
+
+                        // If we get here, it succeeded! Break the loop.
+                        break; 
+                    } catch (err) {
+                        console.warn(`Token ending in ...${token.slice(-4)} failed. trying next. Error: ${err.message}`);
+                        lastError = err;
+                        // The loop continues to the next token automatically
+                    }
+                }
+
+                // If response is still null after checking ALL tokens, then we really failed.
+                if (!response) {
+                    throw new Error(`All ${tokens.length} tokens failed. Last error: ${lastError?.message}`);
+                }
+
+                // --- 4. PROCESSING RESPONSE ---
                 let replyText = '';
                 if (typeof response === 'string') {
                     replyText = response;
@@ -93,24 +124,15 @@ export default async function handler(req, res) {
                     replyText = JSON.stringify(response);
                 }
 
-                // --- CLEAN TEXT (Remove Markdown Symbols & Gaps) ---
+                // --- CLEAN TEXT ---
                 let cleanReply = replyText
-                    // 1. Remove Markdown Formatting
-                    .replace(/\*\*(.*?)\*\*/g, '$1')   // Remove **bold**
-                    .replace(/__(.*?)__/g, '$1')       // Remove __bold__
-                    .replace(/`(.*?)`/g, '$1')         // Remove `code`
-                    .replace(/^#+\s+/gm, '')           // Remove # Headers
-                    
-                    // 2. Remove Horizontal Rules (---, ___, ***)
-                    // Matches a line containing only dashes/underscores/stars
+                    .replace(/\*\*(.*?)\*\*/g, '$1')   
+                    .replace(/__(.*?)__/g, '$1')       
+                    .replace(/`(.*?)`/g, '$1')         
+                    .replace(/^#+\s+/gm, '')           
                     .replace(/^\s*[-_*]{3,}\s*$/gm, '') 
-                    
-                    // 3. Clean up Lists and Asterisks
-                    .replace(/\n\s*-\s/g, '\n• ')      // Nice bullets
-                    .replace(/\*/g, '')                // Remove stray stars
-                    
-                    // 4. Remove Extra Vertical Gaps
-                    // Replaces 3 or more newlines with just 2
+                    .replace(/\n\s*-\s/g, '\n• ')      
+                    .replace(/\*/g, '')                
                     .replace(/\n{3,}/g, '\n\n')
                     .trim();
 
