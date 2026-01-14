@@ -3,9 +3,8 @@ const TelegramBot = require('node-telegram-bot-api');
 const { kv } = require('@vercel/kv');
 const { init } = require('@heyputer/puter.js/src/init.cjs');
 
-// --- HELPER: TAVILY RESEARCHER (Accepts specific API Key) ---
+// --- HELPER: TAVILY RESEARCHER (With Aggressive Checks) ---
 async function performTavilyResearch(userQuery, apiKey) {
-    // We strictly require an API Key to be passed in
     if (!apiKey) return null;
 
     try {
@@ -13,7 +12,7 @@ async function performTavilyResearch(userQuery, apiKey) {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-                api_key: apiKey,            // Use the specific key from the loop
+                api_key: apiKey,
                 query: userQuery,
                 search_depth: "basic",
                 include_answer: true,
@@ -21,9 +20,16 @@ async function performTavilyResearch(userQuery, apiKey) {
             })
         });
 
+        // 1. Check HTTP Status (Standard API failure)
         if (!response.ok) {
-            // Throw error so the loop knows to try the next key
-            throw new Error(`Tavily API Error: ${response.statusText}`);
+            // Try to read the error message from JSON
+            let errText = response.statusText;
+            try {
+                const errJson = await response.json();
+                if (errJson.error && errJson.error.message) errText = errJson.error.message;
+            } catch (e) {}
+            
+            throw new Error(`Tavily API ${response.status}: ${errText}`);
         }
 
         const data = await response.json();
@@ -37,7 +43,7 @@ async function performTavilyResearch(userQuery, apiKey) {
         return context;
 
     } catch (error) {
-        // Rethrow error so the loop can catch it
+        // Just throw it; the loop below catches it and switches keys
         throw error;
     }
 }
@@ -90,51 +96,46 @@ export default async function handler(req, res) {
                 if (!Array.isArray(history)) history = [];
 
                 // ====================================================
-                // 1. TAVILY ROTATION LOGIC (Search Phase)
+                // 1. TAVILY ROTATION LOGIC (With Safety Loop)
                 // ====================================================
                 let messageContent = userMessage;
                 let searchContext = null;
 
                 if (userMessage.startsWith('/s ')) {
                     const query = userMessage.slice(3).trim();
-                    
                     if (query.length > 0) {
                         messageContent = query;
                         await bot.sendChatAction(chatId, 'typing'); 
 
-                        // A. Get Keys & Shuffle
+                        // Get Keys & Shuffle
                         const rawTavilyKeys = process.env.TAVILY_API_KEY || "";
                         let tavilyKeys = rawTavilyKeys.split(',').map(k => k.trim()).filter(Boolean);
                         
-                        if (tavilyKeys.length === 0) {
-                             await bot.sendMessage(chatId, "⚠️ Error: No TAVILY_API_KEY found.");
-                        } else {
-                            // Shuffle Tavily Keys
-                            for (let i = tavilyKeys.length - 1; i > 0; i--) {
-                                const j = Math.floor(Math.random() * (i + 1));
-                                [tavilyKeys[i], tavilyKeys[j]] = [tavilyKeys[j], tavilyKeys[i]];
-                            }
+                        // Shuffle
+                        for (let i = tavilyKeys.length - 1; i > 0; i--) {
+                            const j = Math.floor(Math.random() * (i + 1));
+                            [tavilyKeys[i], tavilyKeys[j]] = [tavilyKeys[j], tavilyKeys[i]];
+                        }
 
-                            // B. Try Keys Loop
-                            let searchSuccess = false;
-                            for (const key of tavilyKeys) {
-                                try {
-                                    const researchResults = await performTavilyResearch(query, key);
-                                    if (researchResults) {
-                                        searchContext = `\n\n[SYSTEM: The user explicitly requested a web search. Here are the Tavily results for "${query}":\n${researchResults}\n\nUse these facts to answer the user.]`;
-                                        searchSuccess = true;
-                                        break; // Success! Stop checking keys.
-                                    }
-                                } catch (err) {
-                                    console.warn(`Tavily Key ending in ...${key.slice(-4)} failed: ${err.message}`);
-                                    // Loop continues to next key automatically
+                        let searchSuccess = false;
+                        
+                        // --- THE TAVILY LOOP ---
+                        for (const key of tavilyKeys) {
+                            try {
+                                const researchResults = await performTavilyResearch(query, key);
+                                if (researchResults) {
+                                    searchContext = `\n\n[SYSTEM: The user explicitly requested a web search. Here are the Tavily results for "${query}":\n${researchResults}\n\nUse these facts to answer the user.]`;
+                                    searchSuccess = true;
+                                    break; // Success! Stop trying keys.
                                 }
+                            } catch (err) {
+                                console.warn(`Tavily Key ending in ...${key.slice(-4)} failed: ${err.message}`);
+                                // If error, loop automatically continues to next key
                             }
+                        }
 
-                            if (!searchSuccess) {
-                                // If ALL keys failed
-                                await bot.sendMessage(chatId, "⚠️ Search failed. All Tavily keys are invalid or out of credits.");
-                            }
+                        if (!searchSuccess && tavilyKeys.length > 0) {
+                            await bot.sendMessage(chatId, "⚠️ Search failed. All Tavily keys are exhausted.");
                         }
                     }
                 }
@@ -142,7 +143,7 @@ export default async function handler(req, res) {
                 history.push({ role: 'user', content: messageContent });
 
                 // ====================================================
-                // 2. PUTER ROTATION LOGIC (Answer Phase)
+                // 2. PUTER ROTATION LOGIC (With Aggressive Checks)
                 // ====================================================
                 const rawTokensString = process.env.PUTER_AUTH_TOKEN;
                 if (!rawTokensString) throw new Error("No PUTER_AUTH_TOKEN found.");
@@ -156,7 +157,6 @@ export default async function handler(req, res) {
                     [tokens[i], tokens[j]] = [tokens[j], tokens[i]];
                 }
 
-                // Prepare Context
                 let messagesToSend = [...history];
                 if (searchContext) {
                     const lastMsgIndex = messagesToSend.length - 1;
@@ -171,39 +171,47 @@ export default async function handler(req, res) {
                     messagesToSend.unshift({ role: 'system', content: process.env.SYSTEM_PROMPT });
                 }
 
-                // Retry Loop for Puter
                 let response = null;
                 let lastError = null;
 
+                // --- THE PUTER LOOP ---
                 for (const token of tokens) {
                     try {
                         const puter = init(token);
-                        
                         const result = await puter.ai.chat(messagesToSend, {
                             model: 'claude-opus-4-5' 
                         });
 
-                        // Validate Result
-                        if (!result) throw new Error("Empty response");
+                        // 1. Basic Validation
+                        if (!result) throw new Error("Empty response from API");
                         if (result.error) throw new Error(JSON.stringify(result));
-                        
-                        // Check for credit warnings in text
+
+                        // 2. AGGRESSIVE ERROR DETECTION
+                        // This forces a crash if the "success" text is actually an error message
                         let tempText = "";
                         if (typeof result === 'string') tempText = result;
                         else if (result?.message?.content) tempText = result.message.content;
 
-                        if (typeof tempText === 'string' && tempText.length < 100) {
-                             const lower = tempText.toLowerCase();
-                             if (lower.includes('credit') || lower.includes('quota') || lower.includes('insufficient')) {
-                                 throw new Error("Credit limit reached");
-                             }
+                        if (typeof tempText === 'string' && tempText.length < 150) {
+                            const lower = tempText.toLowerCase();
+                            const errorPhrases = [
+                                "usage limit", "quota", "insufficient credit",
+                                "upgrade your plan", "reached your limit",
+                                "out of credits", "payment method",
+                                "too many requests", "rate limit"
+                            ];
+                            
+                            if (errorPhrases.some(phrase => lower.includes(phrase))) {
+                                throw new Error(`Token rejected (Quota detected): ${tempText}`);
+                            }
                         }
 
+                        // If we pass, accept response
                         response = result;
-                        break; // Success
+                        break; 
 
                     } catch (err) {
-                        console.warn(`Puter Token ending in ...${token.slice(-4)} failed: ${err.message}`);
+                        console.warn(`Token ending in ...${token.slice(-4)} failed: ${err.message}`);
                         lastError = err;
                     }
                 }
@@ -248,7 +256,6 @@ export default async function handler(req, res) {
                 if (history.length > 20) history = history.slice(-20);
                 await kv.set(dbKey, history);
 
-                // --- SEND RESPONSE ---
                 const MAX_CHUNK_SIZE = 4000;
                 if (cleanReply.length <= MAX_CHUNK_SIZE) {
                     await bot.sendMessage(chatId, cleanReply);
