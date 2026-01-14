@@ -3,307 +3,213 @@ const TelegramBot = require('node-telegram-bot-api');
 const { kv } = require('@vercel/kv');
 const { init } = require('@heyputer/puter.js/src/init.cjs');
 
-// --- HELPER 1: FETCH TOKENS (Gist Only - Strict Validation) ---
+// --- HELPER 1: FETCH TOKENS FROM GIST ---
 async function fetchPuterTokens() {
-    if (!process.env.GIST_TOKEN_URL) {
-        throw new Error("Missing GIST_TOKEN_URL environment variable.");
-    }
-
+    if (!process.env.GIST_TOKEN_URL) throw new Error("Missing GIST_TOKEN_URL env var.");
     try {
-        // Add timestamp to bypass Gist caching
-        const url = `${process.env.GIST_TOKEN_URL}?t=${Date.now()}`;
-        const res = await fetch(url);
-        
-        if (!res.ok) throw new Error(`Failed to fetch Gist: ${res.status}`);
-
+        const res = await fetch(`${process.env.GIST_TOKEN_URL}?t=${Date.now()}`);
+        if (!res.ok) throw new Error(`Gist fetch failed: ${res.status}`);
         const text = await res.text();
-
-        // Safety Check: Did the user provide a non-raw URL?
-        if (text.trim().startsWith("<!DOCTYPE") || text.includes("<html")) {
-            throw new Error("Invalid Gist URL. Please use the 'Raw' button URL.");
-        }
-
-        // Split by newline OR comma
-        const tokens = text.split(/[\n,]+/)
-            .map(t => t.trim())
-            .filter(t => t.length > 10); // Filter out empty or tiny junk strings
-
-        if (tokens.length === 0) {
-            throw new Error("Gist fetched, but found no valid tokens inside.");
-        }
-
+        if (text.includes("<!DOCTYPE")) throw new Error("Invalid Gist URL. Use 'Raw' URL.");
+        
+        const tokens = text.split(/[\n,]+/).map(t => t.trim()).filter(t => t.length > 10);
+        if (tokens.length === 0) throw new Error("No valid tokens found in Gist.");
         return tokens;
-
     } catch (e) {
-        throw new Error(`Gist Error: ${e.message}`);
+        throw new Error(`Token Load Error: ${e.message}`);
     }
 }
 
-// --- HELPER 2: TAVILY RESEARCHER ---
-async function performTavilyResearch(userQuery, apiKey) {
-    if (!apiKey) return null;
+// --- HELPER 2: CLAUDE CALL WRAPPER (Handles Rotation & Error Detection) ---
+async function callClaudeWithRotation(messages) {
+    // 1. Get & Shuffle Tokens
+    let tokens = await fetchPuterTokens();
+    for (let i = tokens.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [tokens[i], tokens[j]] = [tokens[j], tokens[i]];
+    }
+
+    let lastError = null;
+
+    // 2. Retry Loop
+    for (const token of tokens) {
+        try {
+            const puter = init(token);
+            const result = await puter.ai.chat(messages, { model: 'claude-opus-4-5' });
+
+            if (!result) throw new Error("Empty response");
+            if (result.error) throw new Error(JSON.stringify(result));
+
+            // Extract Text
+            let text = typeof result === 'string' ? result : result?.message?.content || "";
+            if (typeof text !== 'string') text = JSON.stringify(text);
+
+            // Aggressive Error Detection
+            if (text.length < 150) {
+                const lower = text.toLowerCase();
+                const failPhrases = ["usage limit", "quota", "insufficient credit", "out of credits", "rate limit"];
+                if (failPhrases.some(p => lower.includes(p))) {
+                    throw new Error(`Quota exceeded: ${text}`);
+                }
+            }
+
+            return text; // Success!
+
+        } catch (err) {
+            console.warn(`Token ...${token.slice(-4)} failed: ${err.message}`);
+            lastError = err;
+        }
+    }
+    throw new Error(`All tokens failed. Last error: ${lastError?.message}`);
+}
+
+// --- HELPER 3: TAVILY RESEARCHER ---
+async function performTavilyResearch(userQuery) {
+    const apiKeyRaw = process.env.TAVILY_API_KEY;
+    if (!apiKeyRaw) return null;
+
+    // Simple Key Rotation for Tavily
+    const keys = apiKeyRaw.split(',').map(k => k.trim()).filter(Boolean);
+    const apiKey = keys[Math.floor(Math.random() * keys.length)];
 
     try {
         const response = await fetch("https://api.tavily.com/search", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                api_key: apiKey,
-                query: userQuery,
-                search_depth: "basic",
-                include_answer: true,
-                max_results: 5
-            })
+            body: JSON.stringify({ api_key: apiKey, query: userQuery, search_depth: "basic", include_answer: true, max_results: 5 })
         });
-
-        if (!response.ok) {
-            let errText = response.statusText;
-            try {
-                const errJson = await response.json();
-                if (errJson.error?.message) errText = errJson.error.message;
-            } catch (e) {}
-            throw new Error(`Tavily API ${response.status}: ${errText}`);
-        }
-
+        
+        if (!response.ok) return null; 
         const data = await response.json();
         
-        let context = `Tavily AI Answer: ${data.answer}\n\nSources Found:\n`;
-        if (data.results && data.results.length > 0) {
-            data.results.forEach((result, index) => {
-                context += `[${index + 1}] Title: ${result.title}\n    URL: ${result.url}\n    Content: ${result.content}\n\n`;
-            });
+        let context = `Tavily AI Summary: ${data.answer}\n\nDetails:\n`;
+        if (data.results) {
+            data.results.forEach((r, i) => context += `[${i+1}] ${r.title}: ${r.content}\n`);
         }
         return context;
-
-    } catch (error) {
-        throw error;
+    } catch (e) {
+        return null;
     }
 }
 
+// --- MAIN HANDLER ---
 export default async function handler(req, res) {
     const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN);
 
     if (req.method === 'POST') {
         const { body } = req;
-
         if (body.message && body.message.text) {
             const chatId = body.message.chat.id;
             const userMessage = body.message.text.trim();
-            
-            // --- WHITELIST CHECK ---
-            const whitelistEnv = process.env.WHITELIST;
-            const allowedUsers = whitelistEnv 
-                ? whitelistEnv.split(',').map(id => id.trim()).filter(Boolean) 
-                : [];
-
-            if (!allowedUsers.includes(chatId.toString())) {
-                await bot.sendMessage(chatId, "You are unauthorized to use this bot.");
-                res.status(200).json({ status: 'unauthorized' });
-                return; 
-            }
-
-            if (userMessage === '/start') {
-                await bot.sendMessage(chatId, "Hi");
-                res.status(200).json({ status: 'ok' });
-                return;
-            }
-
             const dbKey = `chat_history:${chatId}`;
 
+            // 1. Whitelist & Commands
+            const allowed = (process.env.WHITELIST || "").split(',').map(i => i.trim());
+            if (allowed.length > 0 && !allowed.includes(chatId.toString())) {
+                return res.status(200).json({});
+            }
+            if (userMessage === '/start') {
+                await bot.sendMessage(chatId, "Hi");
+                return res.status(200).json({});
+            }
             if (userMessage === '/clear') {
-                try {
-                    await kv.set(dbKey, []); 
-                    await bot.sendMessage(chatId, "✅ Conversation history cleared.");
-                } catch (error) {
-                    await bot.sendMessage(chatId, `⚠️ Failed to clear memory: ${error.message}`);
-                }
-                res.status(200).json({ status: 'ok' });
-                return; 
+                await kv.set(dbKey, []);
+                await bot.sendMessage(chatId, "✅ Memory cleared.");
+                return res.status(200).json({});
             }
 
             await bot.sendChatAction(chatId, 'typing');
 
             try {
-                let history = await kv.get(dbKey);
-                if (!Array.isArray(history)) history = [];
+                // 2. Load History
+                let history = await kv.get(dbKey) || [];
+                history.push({ role: 'user', content: userMessage });
 
                 // ====================================================
-                // 1. TAVILY SEARCH
+                // STEP 1: DECISION PHASE (The Agent)
                 // ====================================================
-                let messageContent = userMessage;
-                let searchContext = null;
-
-                if (userMessage.startsWith('/s ')) {
-                    const query = userMessage.slice(3).trim();
-                    if (query.length > 0) {
-                        messageContent = query;
-                        await bot.sendChatAction(chatId, 'typing'); 
-
-                        const rawTavilyKeys = process.env.TAVILY_API_KEY || "";
-                        let tavilyKeys = rawTavilyKeys.split(',').map(k => k.trim()).filter(Boolean);
+                // We ask Claude: "Do you need to search?"
+                const decisionMessages = [
+                    { 
+                        role: "system", 
+                        content: `You are a helpful assistant with access to a Google Search tool. 
+                        If the user asks a question that requires real-time information (news, weather, stock prices, current events, "who is", "what is"), 
+                        reply ONLY with the format: SEARCH: <query>
                         
-                        // Shuffle keys
-                        for (let i = tavilyKeys.length - 1; i > 0; i--) {
-                            const j = Math.floor(Math.random() * (i + 1));
-                            [tavilyKeys[i], tavilyKeys[j]] = [tavilyKeys[j], tavilyKeys[i]];
-                        }
+                        Examples:
+                        User: "Price of BTC" -> You: SEARCH: current price of bitcoin
+                        User: "Who won the superbowl?" -> You: SEARCH: super bowl winner 2024
+                        User: "Hi there" -> You: Hi! How can I help?
+                        User: "Write a poem" -> You: (Writes poem)
+                        
+                        Do not explain yourself. Just output the SEARCH command or the normal response.` 
+                    },
+                    ...history.slice(-4) // Only look at recent context for decision to save tokens
+                ];
 
-                        let searchSuccess = false;
-                        for (const key of tavilyKeys) {
-                            try {
-                                const researchResults = await performTavilyResearch(query, key);
-                                if (researchResults) {
-                                    searchContext = `\n\n[SYSTEM: The user explicitly requested a web search. Here are the Tavily results for "${query}":\n${researchResults}\n\nUse these facts to answer the user.]`;
-                                    searchSuccess = true;
-                                    break; 
-                                }
-                            } catch (err) {
-                                console.warn(`Tavily Key failed: ${err.message}`);
-                            }
-                        }
-
-                        if (!searchSuccess && tavilyKeys.length > 0) {
-                            await bot.sendMessage(chatId, "⚠️ Search failed. All Tavily keys exhausted.");
-                        }
-                    }
-                }
-                
-                history.push({ role: 'user', content: messageContent });
+                // Call Claude (using our robust rotation helper)
+                let initialResponse = await callClaudeWithRotation(decisionMessages);
+                let finalResponse = initialResponse;
 
                 // ====================================================
-                // 2. PUTER TOKEN ROTATION (Gist + Ruthless Checks)
+                // STEP 2: ACTION PHASE (If Search is needed)
                 // ====================================================
-                
-                let tokens = await fetchPuterTokens(); // Load from Gist
+                if (initialResponse.trim().startsWith("SEARCH:")) {
+                    const searchQuery = initialResponse.replace("SEARCH:", "").trim();
+                    await bot.sendChatAction(chatId, 'typing'); // Keep typing...
 
-                // Shuffle Tokens
-                for (let i = tokens.length - 1; i > 0; i--) {
-                    const j = Math.floor(Math.random() * (i + 1));
-                    [tokens[i], tokens[j]] = [tokens[j], tokens[i]];
-                }
+                    // Perform Search
+                    const searchResults = await performTavilyResearch(searchQuery);
 
-                let messagesToSend = [...history];
-                if (searchContext) {
-                    const lastMsgIndex = messagesToSend.length - 1;
-                    if (lastMsgIndex >= 0) {
-                        messagesToSend[lastMsgIndex] = {
-                            role: 'user',
-                            content: messagesToSend[lastMsgIndex].content + searchContext
+                    if (searchResults) {
+                        // Create the final prompt with the injected knowledge
+                        const searchContextMsg = {
+                            role: "system",
+                            content: `[SYSTEM TOOL OUTPUT]\nUser requested search for: "${searchQuery}"\n\nSearch Results:\n${searchResults}\n\nInstruction: Answer the user's original question using these results.`
                         };
-                    }
-                }
-                if (process.env.SYSTEM_PROMPT) {
-                    messagesToSend.unshift({ role: 'system', content: process.env.SYSTEM_PROMPT });
-                }
 
-                let response = null;
-                let lastError = null;
+                        // We create a new history array for the final answer generation
+                        const finalMessages = [
+                            { role: "system", content: process.env.SYSTEM_PROMPT || "You are a helpful assistant." },
+                            ...history.slice(0, -1), // Previous history
+                            searchContextMsg,        // Inject search results BEFORE the last user msg (or as system context)
+                            { role: "user", content: userMessage }
+                        ];
 
-                // --- THE ROTATION LOOP ---
-                for (const token of tokens) {
-                    try {
-                        const puter = init(token);
-                        const result = await puter.ai.chat(messagesToSend, {
-                            model: 'claude-opus-4-5' 
-                        });
-
-                        // 1. Basic Validation
-                        if (!result) throw new Error("Empty response");
-                        if (result.error) throw new Error(JSON.stringify(result));
-
-                        // 2. RUTHLESS ERROR DETECTION
-                        // We check ANY text returned for failure keywords
-                        let tempText = "";
-                        if (typeof result === 'string') tempText = result;
-                        else if (result?.message?.content) tempText = result.message.content;
-
-                        if (typeof tempText === 'string') {
-                            const lower = tempText.toLowerCase();
-                            const errorPhrases = [
-                                "usage limit",
-                                "quota",
-                                "insufficient credit",
-                                "reached your ai usage limit", // Specific match
-                                "upgrade your plan",
-                                "out of credits",
-                                "payment method",
-                                "rate limit"
-                            ];
-                            
-                            // Check if ANY error phrase is found
-                            const hasError = errorPhrases.some(phrase => lower.includes(phrase));
-
-                            if (hasError) {
-                                throw new Error(`Token rejected (Quota detected): ${tempText.substring(0, 100)}...`);
-                            }
-                        }
-
-                        // If we passed the check, it's valid!
-                        response = result;
-                        break; 
-
-                    } catch (err) {
-                        console.warn(`Token ending in ...${token.slice(-4)} failed: ${err.message}`);
-                        lastError = err;
-                        // Loop continues to next token
-                    }
-                }
-
-                if (!response) {
-                    throw new Error(`All tokens failed. Last error: ${lastError?.message}`);
-                }
-
-                // --- PARSE RESPONSE ---
-                let replyText = '';
-                if (typeof response === 'string') {
-                    replyText = response;
-                } else if (response?.message?.content) {
-                    const content = response.message.content;
-                    if (typeof content === 'string') {
-                        replyText = content;
-                    } else if (Array.isArray(content)) {
-                        replyText = content
-                            .filter(item => item.type === 'text' || item.text)
-                            .map(item => item.text || '')
-                            .join('');
-                    } else {
-                        replyText = JSON.stringify(content);
+                        // Call Claude again for the final answer
+                        finalResponse = await callClaudeWithRotation(finalMessages);
                     }
                 } else {
-                    replyText = JSON.stringify(response);
+                    // If no search was needed, we just use the initial response (e.g., "Hi!", "Here is a poem...")
+                    // However, if the initial response was just "Hi", we might want to ensure we didn't miss the system prompt flavor.
+                    // But usually, Opus is smart enough to just answer directly if no search is needed.
                 }
 
-                // --- CLEAN TEXT ---
-                let cleanReply = replyText
-                    .replace(/\*\*(.*?)\*\*/g, '$1')   
-                    .replace(/__(.*?)__/g, '$1')       
-                    .replace(/`(.*?)`/g, '$1')         
-                    .replace(/^#+\s+/gm, '')           
-                    .replace(/^\s*[-_*]{3,}\s*$/gm, '') 
-                    .replace(/\n\s*-\s/g, '\n• ')      
-                    .replace(/\*/g, '')                
-                    .replace(/\n{3,}/g, '\n\n')
+                // ====================================================
+                // STEP 3: REPLY & SAVE
+                // ====================================================
+                
+                // Clean markdown
+                let cleanReply = finalResponse
+                    .replace(/\*\*(.*?)\*\*/g, '$1')
+                    .replace(/__(.*?)__/g, '$1')
+                    .replace(/^\s*[-_*]{3,}\s*$/gm, '') // Remove horizontal rules
                     .trim();
 
                 history.push({ role: 'assistant', content: cleanReply });
                 if (history.length > 20) history = history.slice(-20);
                 await kv.set(dbKey, history);
 
-                const MAX_CHUNK_SIZE = 4000;
-                if (cleanReply.length <= MAX_CHUNK_SIZE) {
-                    await bot.sendMessage(chatId, cleanReply);
-                } else {
-                    for (let i = 0; i < cleanReply.length; i += MAX_CHUNK_SIZE) {
-                        await bot.sendMessage(chatId, cleanReply.substring(i, i + MAX_CHUNK_SIZE));
-                    }
+                const MAX_CHUNK = 4000;
+                for (let i = 0; i < cleanReply.length; i += MAX_CHUNK) {
+                    await bot.sendMessage(chatId, cleanReply.substring(i, i + MAX_CHUNK));
                 }
 
             } catch (error) {
-                console.error("Chat Error:", error);
-                await bot.sendMessage(chatId, `⚠️ AI Error: ${error.message || error.toString()}`);
+                console.error("Bot Error:", error);
+                await bot.sendMessage(chatId, `⚠️ Error: ${error.message}`);
             }
         }
-
         res.status(200).json({ status: 'ok' });
     } else {
         res.status(200).json({ status: 'ready' });
