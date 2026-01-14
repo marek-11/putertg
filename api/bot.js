@@ -131,76 +131,96 @@ export default async function handler(req, res) {
                 let history = await kv.get(dbKey) || [];
                 history.push({ role: 'user', content: userMessage });
 
-                // 1. GET DATE
+                // ----------------------------------------------------
+                // 1. GET DATE (For "Today" queries)
+                // ----------------------------------------------------
                 const now = new Date();
                 const dateString = now.toLocaleDateString("en-US", { 
                     weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' 
                 });
 
-                // 2. DECISION PHASE
-                const decisionMessages = [
-                    { 
-                        role: "system", 
-                        content: `Current Date: ${dateString}
-                        You are a helpful assistant with a Web Search tool.
-                        
-                        You MUST trigger a search if:
-                        1. The user asks about Real-time events (News, Weather, Sports).
-                        2. The query implies current data ("Today", "Now", "Latest").
-                        3. You do not know the answer.
-                        
-                        When searching for "Today", use the date ${dateString}.
-                        Reply ONLY with: SEARCH: <concise_search_query>
-                        
-                        Examples:
-                        User: "LPA in PAR today?" -> You: SEARCH: Low Pressure Area Philippines ${dateString}
-                        User: "Bitcoin price" -> You: SEARCH: Bitcoin price ${dateString}
-                        
-                        If no search is needed, answer normally.` 
-                    },
-                    ...history.slice(-4) 
+                // ----------------------------------------------------
+                // 2. ROUTER PHASE (Strict Classifier)
+                // ----------------------------------------------------
+                // This model is NOT allowed to chat. It only outputs commands.
+                const routerPrompt = `Current Date: ${dateString}
+
+You are a classification tool. You do NOT answer questions. You ONLY output a command.
+
+Check the user's last message. Does it require external information (News, Weather, People, "Who is", "Latest", "Price of")?
+
+- YES -> Output: SEARCH: <query with date>
+- NO  -> Output: DIRECT_ANSWER
+
+Examples:
+User: "Hi" -> DIRECT_ANSWER
+User: "News on Duterte" -> SEARCH: latest news Rodrigo Duterte ${dateString}
+User: "Weather today" -> SEARCH: weather forecast ${dateString}
+User: "Who is the CEO of X?" -> SEARCH: current CEO of X
+User: "Write a poem" -> DIRECT_ANSWER`;
+
+                const routerMessages = [
+                    { role: "system", content: routerPrompt },
+                    { role: "user", content: userMessage } // Only classify the LATEST message
                 ];
 
-                let initialResponse = await callClaudeWithRotation(decisionMessages);
-                let finalResponse = initialResponse;
+                const routerResponse = await callClaudeWithRotation(routerMessages);
+                
+                let finalResponse = "";
 
-                // 3. ACTION PHASE
-                if (initialResponse.trim().startsWith("SEARCH:")) {
-                    const searchQuery = initialResponse.replace("SEARCH:", "").trim();
+                // ----------------------------------------------------
+                // 3. EXECUTION PHASE
+                // ----------------------------------------------------
+                
+                // CASE A: SEARCH REQUIRED
+                if (routerResponse.trim().startsWith("SEARCH:")) {
+                    const searchQuery = routerResponse.replace("SEARCH:", "").trim();
                     await bot.sendChatAction(chatId, 'typing'); 
-
+                    
+                    // Force the search
                     const searchResults = await performTavilyResearch(searchQuery);
 
-                    if (searchResults) {
-                        const searchContextMsg = {
-                            role: "system",
-                            content: `[SYSTEM TOOL OUTPUT]\nCurrent Date: ${dateString}\nUser requested search for: "${searchQuery}"\n\nSearch Results:\n${searchResults}\n\nInstruction: Answer the user's question using these results. If results are outdated, explicitly mention that.`
-                        };
+                    // Build context for the Answerer
+                    const contextMsg = {
+                        role: "system",
+                        content: `[SYSTEM DATA]\nDate: ${dateString}\nSearch Query: "${searchQuery}"\nResults:\n${searchResults || "No results found."}\n\nInstruction: Answer using these results. If results are empty, say so.`
+                    };
 
-                        const finalMessages = [
-                            { role: "system", content: process.env.SYSTEM_PROMPT || "You are a helpful assistant." },
-                            ...history.slice(0, -1), 
-                            searchContextMsg,        
-                            { role: "user", content: userMessage }
-                        ];
+                    const answerMessages = [
+                        { role: "system", content: process.env.SYSTEM_PROMPT || "You are a helpful assistant." },
+                        ...history.slice(0, -1), // History
+                        contextMsg,              // Search Data
+                        { role: "user", content: userMessage }
+                    ];
 
-                        finalResponse = await callClaudeWithRotation(finalMessages);
-                    }
+                    finalResponse = await callClaudeWithRotation(answerMessages);
+                } 
+                
+                // CASE B: NO SEARCH (Direct Answer)
+                else {
+                    // Just call the model normally with history
+                    const answerMessages = [
+                        { role: "system", content: process.env.SYSTEM_PROMPT || "You are a helpful assistant." },
+                        ...history
+                    ];
+                    finalResponse = await callClaudeWithRotation(answerMessages);
                 }
 
-                // 4. CLEANUP & REPLY (FIXED FORMATTING)
+                // ----------------------------------------------------
+                // 4. CLEANUP & REPLY (Fix Headers)
+                // ----------------------------------------------------
                 let replyText = finalResponse
-                    // Convert Headers (## Title) to Bold (*Title*)
+                    // Fix: Convert '### Header' to '*Header*' (Bold)
                     .replace(/^#{1,6}\s+(.*?)$/gm, '*$1*')
                     
-                    // Convert Bold (**text**) to Telegram Bold (*text*)
+                    // Fix: Convert '**Bold**' to Telegram '*Bold*'
                     .replace(/\*\*(.*?)\*\*/g, '*$1*')
                     .replace(/__(.*?)__/g, '*$1*')
                     
-                    // Convert Bullet points
+                    // Fix: Convert lists
                     .replace(/^\s*-\s+/gm, '• ')
                     
-                    // Remove horizontal rules
+                    // Fix: Remove horizontal lines
                     .replace(/^\s*[-_*]{3,}\s*$/gm, '')
                     
                     .trim();
@@ -215,9 +235,9 @@ export default async function handler(req, res) {
                 }
 
             } catch (error) {
+                // If markdown fails, send plain text
                 try {
-                    // Fallback to plain text if markdown fails
-                    await bot.sendMessage(chatId, finalResponse); 
+                    await bot.sendMessage(chatId, error.message.includes('Markdown') ? finalResponse : `⚠️ Error: ${error.message}`);
                 } catch (e) { console.error(e); }
             }
         }
