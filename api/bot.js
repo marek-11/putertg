@@ -20,7 +20,7 @@ async function fetchPuterTokens() {
     }
 }
 
-// --- HELPER 2: CLAUDE CALL WRAPPER (With Fixed Parsing) ---
+// --- HELPER 2: CLAUDE CALL WRAPPER (Robust) ---
 async function callClaudeWithRotation(messages) {
     let tokens = await fetchPuterTokens();
     
@@ -40,43 +40,22 @@ async function callClaudeWithRotation(messages) {
             if (!result) throw new Error("Empty response");
             if (result.error) throw new Error(JSON.stringify(result));
 
-            // --- FIXED PARSING LOGIC ---
             let text = "";
-
-            // Case A: Simple String
             if (typeof result === 'string') {
                 text = result;
-            } 
-            // Case B: Object with message.content
-            else if (result?.message?.content) {
+            } else if (result?.message?.content) {
                 const content = result.message.content;
-                
-                if (typeof content === 'string') {
-                    text = content;
-                } else if (Array.isArray(content)) {
-                    // Extract text from blocks like [{ type: 'text', text: '...' }]
-                    text = content
-                        .filter(block => block.type === 'text' || block.text)
-                        .map(block => block.text || '')
-                        .join('');
+                if (typeof content === 'string') text = content;
+                else if (Array.isArray(content)) {
+                    text = content.filter(b => b.type === 'text' || b.text).map(b => b.text || '').join('');
                 }
-            } 
-            // Case C: Raw Array (The issue you saw)
-            else if (Array.isArray(result)) {
-                 text = result
-                    .filter(block => block.type === 'text' || block.text)
-                    .map(block => block.text || '')
-                    .join('');
-            }
-            // Case D: Fallback
-            else {
+            } else if (Array.isArray(result)) {
+                 text = result.map(b => b.text || '').join('');
+            } else {
                 text = JSON.stringify(result);
             }
-
-            // Clean up any lingering quotes or whitespace
             text = text.trim();
 
-            // Aggressive Error Detection
             if (text.length < 150) {
                 const lower = text.toLowerCase();
                 const failPhrases = ["usage limit", "quota", "insufficient credit", "out of credits", "rate limit"];
@@ -84,9 +63,7 @@ async function callClaudeWithRotation(messages) {
                     throw new Error(`Quota exceeded: ${text}`);
                 }
             }
-
             return text;
-
         } catch (err) {
             console.warn(`Token ...${token.slice(-4)} failed: ${err.message}`);
             lastError = err;
@@ -155,21 +132,28 @@ export default async function handler(req, res) {
                 history.push({ role: 'user', content: userMessage });
 
                 // ====================================================
-                // STEP 1: DECISION PHASE
+                // STEP 1: DECISION PHASE (Enhanced "I Don't Know" Logic)
                 // ====================================================
                 const decisionMessages = [
                     { 
                         role: "system", 
-                        content: `You are a helpful assistant with access to a Google Search tool. 
-                        If the user asks a question that requires real-time information (news, weather, stock prices, current events, "who is", "what is"), 
-                        reply ONLY with the format: SEARCH: <query>
+                        // UPDATED PROMPT: Covers "No Info" and "Unknown" scenarios
+                        content: `You are a helpful assistant with a Web Search tool.
+                        
+                        Your goal is to provide accurate answers. You MUST trigger a search if:
+                        1. The user asks about Real-time events (News, Weather, Sports).
+                        2. The query implies current/latest data ("Today", "Price of", "Latest").
+                        3. **You simply DO NOT KNOW the answer** or your internal knowledge is insufficient.
+                        4. **You are UNSURE** and need to verify facts.
+                        
+                        If ANY of these apply, reply ONLY with: SEARCH: <concise_search_query>
                         
                         Examples:
-                        User: "Price of BTC" -> You: SEARCH: current price of bitcoin
-                        User: "Who won the superbowl?" -> You: SEARCH: super bowl winner 2024
-                        User: "Hi there" -> You: Hi! How can I help?
+                        User: "Who is the CEO of SomeObscureStartup?" (If unknown) -> You: SEARCH: CEO of SomeObscureStartup
+                        User: "LPA in PAR today?" -> You: SEARCH: Low Pressure Area Philippines today
+                        User: "What is the capital of France?" (Known) -> You: Paris is the capital of France.
                         
-                        Do not explain yourself. Just output the SEARCH command or the normal response.` 
+                        Do not explain. Just output the command or the normal answer.` 
                     },
                     ...history.slice(-4) 
                 ];
@@ -189,7 +173,7 @@ export default async function handler(req, res) {
                     if (searchResults) {
                         const searchContextMsg = {
                             role: "system",
-                            content: `[SYSTEM TOOL OUTPUT]\nUser requested search for: "${searchQuery}"\n\nSearch Results:\n${searchResults}\n\nInstruction: Answer the user's original question using these results.`
+                            content: `[SYSTEM TOOL OUTPUT]\nUser requested search for: "${searchQuery}"\n\nSearch Results:\n${searchResults}\n\nInstruction: Answer the user's question using these results. If the results are empty, admit you couldn't find info.`
                         };
 
                         const finalMessages = [
@@ -204,26 +188,27 @@ export default async function handler(req, res) {
                 }
 
                 // ====================================================
-                // STEP 3: REPLY
+                // STEP 3: REPLY (Markdown Supported)
                 // ====================================================
-                let cleanReply = finalResponse
-                    .replace(/\*\*(.*?)\*\*/g, '$1')
-                    .replace(/__(.*?)__/g, '$1')
-                    .replace(/^\s*[-_*]{3,}\s*$/gm, '') 
+                let replyText = finalResponse
+                    .replace(/\*\*(.*?)\*\*/g, '*$1*') // Bold
+                    .replace(/__(.*?)__/g, '*$1*')     // Bold
                     .trim();
 
-                history.push({ role: 'assistant', content: cleanReply });
+                history.push({ role: 'assistant', content: replyText });
                 if (history.length > 20) history = history.slice(-20);
                 await kv.set(dbKey, history);
 
                 const MAX_CHUNK = 4000;
-                for (let i = 0; i < cleanReply.length; i += MAX_CHUNK) {
-                    await bot.sendMessage(chatId, cleanReply.substring(i, i + MAX_CHUNK));
+                for (let i = 0; i < replyText.length; i += MAX_CHUNK) {
+                    await bot.sendMessage(chatId, replyText.substring(i, i + MAX_CHUNK), { parse_mode: 'Markdown' });
                 }
 
             } catch (error) {
-                console.error("Bot Error:", error);
-                await bot.sendMessage(chatId, `⚠️ Error: ${error.message}`);
+                // Fallback for markdown errors
+                try {
+                    await bot.sendMessage(chatId, error.message.includes('Markdown') ? finalResponse : `⚠️ Error: ${error.message}`);
+                } catch (e) { console.error(e); }
             }
         }
         res.status(200).json({ status: 'ok' });
