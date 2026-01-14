@@ -20,7 +20,7 @@ async function fetchPuterTokens() {
     }
 }
 
-// --- HELPER 2: CLAUDE CALL WRAPPER (Robust) ---
+// --- HELPER 2: CLAUDE CALL WRAPPER ---
 async function callClaudeWithRotation(messages) {
     let tokens = await fetchPuterTokens();
     
@@ -131,29 +131,39 @@ export default async function handler(req, res) {
                 let history = await kv.get(dbKey) || [];
                 history.push({ role: 'user', content: userMessage });
 
-                // ====================================================
-                // STEP 1: DECISION PHASE (Enhanced "I Don't Know" Logic)
-                // ====================================================
+                // ----------------------------------------------------
+                // 1. GET CURRENT DATE
+                // ----------------------------------------------------
+                const now = new Date();
+                const dateString = now.toLocaleDateString("en-US", { 
+                    weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' 
+                });
+
+                // ----------------------------------------------------
+                // 2. DECISION PHASE (With Date Injection)
+                // ----------------------------------------------------
                 const decisionMessages = [
                     { 
                         role: "system", 
-                        // UPDATED PROMPT: Covers "No Info" and "Unknown" scenarios
-                        content: `You are a helpful assistant with a Web Search tool.
+                        content: `Current Date: ${dateString}
                         
-                        Your goal is to provide accurate answers. You MUST trigger a search if:
+                        You are a helpful assistant with a Web Search tool.
+                        
+                        You MUST trigger a search if:
                         1. The user asks about Real-time events (News, Weather, Sports).
-                        2. The query implies current/latest data ("Today", "Price of", "Latest").
-                        3. **You simply DO NOT KNOW the answer** or your internal knowledge is insufficient.
-                        4. **You are UNSURE** and need to verify facts.
+                        2. The query implies current data ("Today", "Now", "Latest").
+                        3. You do not know the answer.
                         
-                        If ANY of these apply, reply ONLY with: SEARCH: <concise_search_query>
+                        IMPORTANT: When searching for "Today" or "Current", replace those words with the specific date (${dateString}) to get accurate results.
+                        
+                        Reply ONLY with: SEARCH: <concise_search_query>
                         
                         Examples:
-                        User: "Who is the CEO of SomeObscureStartup?" (If unknown) -> You: SEARCH: CEO of SomeObscureStartup
-                        User: "LPA in PAR today?" -> You: SEARCH: Low Pressure Area Philippines today
-                        User: "What is the capital of France?" (Known) -> You: Paris is the capital of France.
+                        User: "LPA in PAR today?" -> You: SEARCH: Low Pressure Area Philippines ${dateString}
+                        User: "Bitcoin price" -> You: SEARCH: Bitcoin price ${dateString}
+                        User: "Who won the game?" -> You: SEARCH: sports results ${dateString}
                         
-                        Do not explain. Just output the command or the normal answer.` 
+                        If no search is needed, answer normally.` 
                     },
                     ...history.slice(-4) 
                 ];
@@ -161,9 +171,9 @@ export default async function handler(req, res) {
                 let initialResponse = await callClaudeWithRotation(decisionMessages);
                 let finalResponse = initialResponse;
 
-                // ====================================================
-                // STEP 2: ACTION PHASE
-                // ====================================================
+                // ----------------------------------------------------
+                // 3. ACTION PHASE
+                // ----------------------------------------------------
                 if (initialResponse.trim().startsWith("SEARCH:")) {
                     const searchQuery = initialResponse.replace("SEARCH:", "").trim();
                     await bot.sendChatAction(chatId, 'typing'); 
@@ -173,7 +183,7 @@ export default async function handler(req, res) {
                     if (searchResults) {
                         const searchContextMsg = {
                             role: "system",
-                            content: `[SYSTEM TOOL OUTPUT]\nUser requested search for: "${searchQuery}"\n\nSearch Results:\n${searchResults}\n\nInstruction: Answer the user's question using these results. If the results are empty, admit you couldn't find info.`
+                            content: `[SYSTEM TOOL OUTPUT]\nCurrent Date: ${dateString}\nUser requested search for: "${searchQuery}"\n\nSearch Results:\n${searchResults}\n\nInstruction: Answer the user's question using these results. If results are outdated, explicitly mention that.`
                         };
 
                         const finalMessages = [
@@ -187,12 +197,12 @@ export default async function handler(req, res) {
                     }
                 }
 
-                // ====================================================
-                // STEP 3: REPLY (Markdown Supported)
-                // ====================================================
+                // ----------------------------------------------------
+                // 4. REPLY
+                // ----------------------------------------------------
                 let replyText = finalResponse
-                    .replace(/\*\*(.*?)\*\*/g, '*$1*') // Bold
-                    .replace(/__(.*?)__/g, '*$1*')     // Bold
+                    .replace(/\*\*(.*?)\*\*/g, '*$1*') 
+                    .replace(/__(.*?)__/g, '*$1*')     
                     .trim();
 
                 history.push({ role: 'assistant', content: replyText });
@@ -205,7 +215,6 @@ export default async function handler(req, res) {
                 }
 
             } catch (error) {
-                // Fallback for markdown errors
                 try {
                     await bot.sendMessage(chatId, error.message.includes('Markdown') ? finalResponse : `⚠️ Error: ${error.message}`);
                 } catch (e) { console.error(e); }
