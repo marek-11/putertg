@@ -137,23 +137,23 @@ export default async function handler(req, res) {
                     weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' 
                 });
 
-                // 2. ROUTER PHASE (Context-Aware)
+                // 2. ROUTER PHASE (Now sees Hidden Context from previous turns!)
                 const routerPrompt = `Current Date: ${dateString}
 
 You are a classification tool. Look at the CONVERSATION HISTORY.
 
-1. Does the latest user message require external information (News, Weather, "Who is", "Latest", "Price")?
-2. Is the user asking a FOLLOW-UP question about a topic that required a search previously? (e.g., "Why?", "Tell me more", "Does not make sense")
+1. Does the latest user message require external information?
+2. Is the user asking a FOLLOW-UP, CHALLENGE, or CLARIFICATION about a previous topic?
 
 - YES -> Output: SEARCH: <query with date>
 - NO  -> Output: DIRECT_ANSWER
 
 Examples:
 User: "News on Duterte" -> SEARCH: latest news Rodrigo Duterte ${dateString}
-User: "Why did he do that?" (Follow up) -> SEARCH: reasons for Duterte's actions ${dateString}
+User: "That doesn't make sense" (Context: Stranger Things) -> SEARCH: Stranger Things plot explanation logic
+User: "Why?" (Context: Stocks) -> SEARCH: reasons for stock market drop ${dateString}
 User: "Write a poem" -> DIRECT_ANSWER`;
 
-                // We send the last 3 messages so the router sees the context
                 const routerMessages = [
                     { role: "system", content: routerPrompt },
                     ...history.slice(-3) 
@@ -162,6 +162,7 @@ User: "Write a poem" -> DIRECT_ANSWER`;
                 const routerResponse = await callClaudeWithRotation(routerMessages);
                 
                 let finalResponse = "";
+                let hiddenSearchData = ""; // We will store search results here to hide them later
 
                 // 3. EXECUTION PHASE
                 if (routerResponse.trim().startsWith("SEARCH:")) {
@@ -170,10 +171,14 @@ User: "Write a poem" -> DIRECT_ANSWER`;
                     
                     const searchResults = await performTavilyResearch(searchQuery);
 
-                    // --- SYSTEM INSTRUCTION FOR DIRECTNESS ---
+                    // Store results for the DB, so next turn remembers them
+                    if (searchResults) {
+                        hiddenSearchData = `\n\n:::SEARCH_CONTEXT:::\nQuery: ${searchQuery}\n${searchResults}\n:::END_SEARCH_CONTEXT:::`;
+                    }
+
                     const contextMsg = {
                         role: "system",
-                        content: `[SYSTEM DATA]\nDate: ${dateString}\nSearch Query: "${searchQuery}"\nResults:\n${searchResults || "No results found."}\n\nInstruction: Answer the user's question directly using these results.\n\nCRITICAL STYLE RULE: Do NOT say "Based on the search results", "According to the search", or "The results show". Just state the answer directly and professionally as if you already knew it.`
+                        content: `[SYSTEM DATA]\nDate: ${dateString}\nSearch Query: "${searchQuery}"\nResults:\n${searchResults || "No results found."}\n\nInstruction: Answer the user's question directly using these results.\n\nCRITICAL STYLE RULE: Do NOT say "Based on the search results" or "According to...". Answer confidently and professionally as if you already knew it.`
                     };
 
                     const answerMessages = [
@@ -195,7 +200,7 @@ User: "Write a poem" -> DIRECT_ANSWER`;
                 }
 
                 // 4. CLEANUP & REPLY
-                let replyText = finalResponse
+                let cleanReply = finalResponse
                     .replace(/^#{1,6}\s+(.*?)$/gm, '*$1*') 
                     .replace(/\*\*(.*?)\*\*/g, '*$1*')    
                     .replace(/__(.*?)__/g, '*$1*')
@@ -203,13 +208,21 @@ User: "Write a poem" -> DIRECT_ANSWER`;
                     .replace(/^\s*[-_*]{3,}\s*$/gm, '')    
                     .trim();
 
-                history.push({ role: 'assistant', content: replyText });
+                // 5. SAVE TO DB WITH HIDDEN CONTEXT
+                // We append the hidden search data to the message in the database ONLY.
+                // The user never sees it, but the AI sees it in the history next time.
+                const dbContent = cleanReply + hiddenSearchData;
+
+                history.push({ role: 'assistant', content: dbContent });
+                
+                // Keep history manageable (last 20 turns)
                 if (history.length > 20) history = history.slice(-20);
                 await kv.set(dbKey, history);
 
+                // 6. SEND TO USER (WITHOUT HIDDEN CONTEXT)
                 const MAX_CHUNK = 4000;
-                for (let i = 0; i < replyText.length; i += MAX_CHUNK) {
-                    await bot.sendMessage(chatId, replyText.substring(i, i + MAX_CHUNK), { parse_mode: 'Markdown' });
+                for (let i = 0; i < cleanReply.length; i += MAX_CHUNK) {
+                    await bot.sendMessage(chatId, cleanReply.substring(i, i + MAX_CHUNK), { parse_mode: 'Markdown' });
                 }
 
             } catch (error) {
