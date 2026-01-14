@@ -3,7 +3,39 @@ const TelegramBot = require('node-telegram-bot-api');
 const { kv } = require('@vercel/kv');
 const { init } = require('@heyputer/puter.js/src/init.cjs');
 
-// --- HELPER: TAVILY RESEARCHER (With Aggressive Checks) ---
+// --- HELPER 1: FETCH TOKENS (Gist Only - No Fallback) ---
+async function fetchPuterTokens() {
+    let tokens = [];
+
+    if (!process.env.GIST_TOKEN_URL) {
+        throw new Error("Missing GIST_TOKEN_URL environment variable.");
+    }
+
+    try {
+        // Add a timestamp to bypass caching
+        const url = `${process.env.GIST_TOKEN_URL}?t=${Date.now()}`;
+        const res = await fetch(url);
+        
+        if (!res.ok) {
+            throw new Error(`Failed to fetch Gist: ${res.status} ${res.statusText}`);
+        }
+
+        const text = await res.text();
+        // Split by newline OR comma to handle different formats
+        tokens = text.split(/[\n,]+/).map(t => t.trim()).filter(Boolean);
+
+    } catch (e) {
+        throw new Error(`Error loading tokens from Gist: ${e.message}`);
+    }
+
+    if (tokens.length === 0) {
+        throw new Error("Gist found, but it contained no valid tokens.");
+    }
+
+    return tokens;
+}
+
+// --- HELPER 2: TAVILY RESEARCHER (With Rotation & Safety) ---
 async function performTavilyResearch(userQuery, apiKey) {
     if (!apiKey) return null;
 
@@ -20,15 +52,12 @@ async function performTavilyResearch(userQuery, apiKey) {
             })
         });
 
-        // 1. Check HTTP Status (Standard API failure)
         if (!response.ok) {
-            // Try to read the error message from JSON
             let errText = response.statusText;
             try {
                 const errJson = await response.json();
                 if (errJson.error && errJson.error.message) errText = errJson.error.message;
             } catch (e) {}
-            
             throw new Error(`Tavily API ${response.status}: ${errText}`);
         }
 
@@ -43,7 +72,6 @@ async function performTavilyResearch(userQuery, apiKey) {
         return context;
 
     } catch (error) {
-        // Just throw it; the loop below catches it and switches keys
         throw error;
     }
 }
@@ -96,7 +124,7 @@ export default async function handler(req, res) {
                 if (!Array.isArray(history)) history = [];
 
                 // ====================================================
-                // 1. TAVILY ROTATION LOGIC (With Safety Loop)
+                // 1. TAVILY ROTATION LOGIC
                 // ====================================================
                 let messageContent = userMessage;
                 let searchContext = null;
@@ -107,30 +135,26 @@ export default async function handler(req, res) {
                         messageContent = query;
                         await bot.sendChatAction(chatId, 'typing'); 
 
-                        // Get Keys & Shuffle
                         const rawTavilyKeys = process.env.TAVILY_API_KEY || "";
                         let tavilyKeys = rawTavilyKeys.split(',').map(k => k.trim()).filter(Boolean);
                         
-                        // Shuffle
+                        // Shuffle Tavily Keys
                         for (let i = tavilyKeys.length - 1; i > 0; i--) {
                             const j = Math.floor(Math.random() * (i + 1));
                             [tavilyKeys[i], tavilyKeys[j]] = [tavilyKeys[j], tavilyKeys[i]];
                         }
 
                         let searchSuccess = false;
-                        
-                        // --- THE TAVILY LOOP ---
                         for (const key of tavilyKeys) {
                             try {
                                 const researchResults = await performTavilyResearch(query, key);
                                 if (researchResults) {
                                     searchContext = `\n\n[SYSTEM: The user explicitly requested a web search. Here are the Tavily results for "${query}":\n${researchResults}\n\nUse these facts to answer the user.]`;
                                     searchSuccess = true;
-                                    break; // Success! Stop trying keys.
+                                    break; 
                                 }
                             } catch (err) {
-                                console.warn(`Tavily Key ending in ...${key.slice(-4)} failed: ${err.message}`);
-                                // If error, loop automatically continues to next key
+                                console.warn(`Tavily Key failed: ${err.message}`);
                             }
                         }
 
@@ -143,15 +167,13 @@ export default async function handler(req, res) {
                 history.push({ role: 'user', content: messageContent });
 
                 // ====================================================
-                // 2. PUTER ROTATION LOGIC (With Aggressive Checks)
+                // 2. PUTER ROTATION LOGIC (Gist Only + Aggressive Checks)
                 // ====================================================
-                const rawTokensString = process.env.PUTER_AUTH_TOKEN;
-                if (!rawTokensString) throw new Error("No PUTER_AUTH_TOKEN found.");
                 
-                let tokens = rawTokensString.split(',').map(t => t.trim()).filter(Boolean);
-                if (tokens.length === 0) throw new Error("PUTER_AUTH_TOKEN is empty.");
+                // Fetch tokens strictly from Gist
+                let tokens = await fetchPuterTokens();
 
-                // Shuffle Puter Tokens
+                // Shuffle Tokens
                 for (let i = tokens.length - 1; i > 0; i--) {
                     const j = Math.floor(Math.random() * (i + 1));
                     [tokens[i], tokens[j]] = [tokens[j], tokens[i]];
@@ -174,7 +196,7 @@ export default async function handler(req, res) {
                 let response = null;
                 let lastError = null;
 
-                // --- THE PUTER LOOP ---
+                // --- THE ROBUST LOOP ---
                 for (const token of tokens) {
                     try {
                         const puter = init(token);
@@ -187,7 +209,6 @@ export default async function handler(req, res) {
                         if (result.error) throw new Error(JSON.stringify(result));
 
                         // 2. AGGRESSIVE ERROR DETECTION
-                        // This forces a crash if the "success" text is actually an error message
                         let tempText = "";
                         if (typeof result === 'string') tempText = result;
                         else if (result?.message?.content) tempText = result.message.content;
@@ -206,7 +227,6 @@ export default async function handler(req, res) {
                             }
                         }
 
-                        // If we pass, accept response
                         response = result;
                         break; 
 
