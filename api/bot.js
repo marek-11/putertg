@@ -3,39 +3,43 @@ const TelegramBot = require('node-telegram-bot-api');
 const { kv } = require('@vercel/kv');
 const { init } = require('@heyputer/puter.js/src/init.cjs');
 
-// --- HELPER 1: FETCH TOKENS (Gist Only - No Fallback) ---
+// --- HELPER 1: FETCH TOKENS (Gist Only - Strict Validation) ---
 async function fetchPuterTokens() {
-    let tokens = [];
-
     if (!process.env.GIST_TOKEN_URL) {
         throw new Error("Missing GIST_TOKEN_URL environment variable.");
     }
 
     try {
-        // Add a timestamp to bypass caching
+        // Add timestamp to bypass Gist caching
         const url = `${process.env.GIST_TOKEN_URL}?t=${Date.now()}`;
         const res = await fetch(url);
         
-        if (!res.ok) {
-            throw new Error(`Failed to fetch Gist: ${res.status} ${res.statusText}`);
-        }
+        if (!res.ok) throw new Error(`Failed to fetch Gist: ${res.status}`);
 
         const text = await res.text();
-        // Split by newline OR comma to handle different formats
-        tokens = text.split(/[\n,]+/).map(t => t.trim()).filter(Boolean);
+
+        // Safety Check: Did the user provide a non-raw URL?
+        if (text.trim().startsWith("<!DOCTYPE") || text.includes("<html")) {
+            throw new Error("Invalid Gist URL. Please use the 'Raw' button URL.");
+        }
+
+        // Split by newline OR comma
+        const tokens = text.split(/[\n,]+/)
+            .map(t => t.trim())
+            .filter(t => t.length > 10); // Filter out empty or tiny junk strings
+
+        if (tokens.length === 0) {
+            throw new Error("Gist fetched, but found no valid tokens inside.");
+        }
+
+        return tokens;
 
     } catch (e) {
-        throw new Error(`Error loading tokens from Gist: ${e.message}`);
+        throw new Error(`Gist Error: ${e.message}`);
     }
-
-    if (tokens.length === 0) {
-        throw new Error("Gist found, but it contained no valid tokens.");
-    }
-
-    return tokens;
 }
 
-// --- HELPER 2: TAVILY RESEARCHER (With Rotation & Safety) ---
+// --- HELPER 2: TAVILY RESEARCHER ---
 async function performTavilyResearch(userQuery, apiKey) {
     if (!apiKey) return null;
 
@@ -56,7 +60,7 @@ async function performTavilyResearch(userQuery, apiKey) {
             let errText = response.statusText;
             try {
                 const errJson = await response.json();
-                if (errJson.error && errJson.error.message) errText = errJson.error.message;
+                if (errJson.error?.message) errText = errJson.error.message;
             } catch (e) {}
             throw new Error(`Tavily API ${response.status}: ${errText}`);
         }
@@ -124,7 +128,7 @@ export default async function handler(req, res) {
                 if (!Array.isArray(history)) history = [];
 
                 // ====================================================
-                // 1. TAVILY ROTATION LOGIC
+                // 1. TAVILY SEARCH
                 // ====================================================
                 let messageContent = userMessage;
                 let searchContext = null;
@@ -138,7 +142,7 @@ export default async function handler(req, res) {
                         const rawTavilyKeys = process.env.TAVILY_API_KEY || "";
                         let tavilyKeys = rawTavilyKeys.split(',').map(k => k.trim()).filter(Boolean);
                         
-                        // Shuffle Tavily Keys
+                        // Shuffle keys
                         for (let i = tavilyKeys.length - 1; i > 0; i--) {
                             const j = Math.floor(Math.random() * (i + 1));
                             [tavilyKeys[i], tavilyKeys[j]] = [tavilyKeys[j], tavilyKeys[i]];
@@ -159,7 +163,7 @@ export default async function handler(req, res) {
                         }
 
                         if (!searchSuccess && tavilyKeys.length > 0) {
-                            await bot.sendMessage(chatId, "⚠️ Search failed. All Tavily keys are exhausted.");
+                            await bot.sendMessage(chatId, "⚠️ Search failed. All Tavily keys exhausted.");
                         }
                     }
                 }
@@ -167,11 +171,10 @@ export default async function handler(req, res) {
                 history.push({ role: 'user', content: messageContent });
 
                 // ====================================================
-                // 2. PUTER ROTATION LOGIC (Gist Only + Aggressive Checks)
+                // 2. PUTER TOKEN ROTATION (Gist + Ruthless Checks)
                 // ====================================================
                 
-                // Fetch tokens strictly from Gist
-                let tokens = await fetchPuterTokens();
+                let tokens = await fetchPuterTokens(); // Load from Gist
 
                 // Shuffle Tokens
                 for (let i = tokens.length - 1; i > 0; i--) {
@@ -196,7 +199,7 @@ export default async function handler(req, res) {
                 let response = null;
                 let lastError = null;
 
-                // --- THE ROBUST LOOP ---
+                // --- THE ROTATION LOOP ---
                 for (const token of tokens) {
                     try {
                         const puter = init(token);
@@ -205,34 +208,44 @@ export default async function handler(req, res) {
                         });
 
                         // 1. Basic Validation
-                        if (!result) throw new Error("Empty response from API");
+                        if (!result) throw new Error("Empty response");
                         if (result.error) throw new Error(JSON.stringify(result));
 
-                        // 2. AGGRESSIVE ERROR DETECTION
+                        // 2. RUTHLESS ERROR DETECTION
+                        // We check ANY text returned for failure keywords
                         let tempText = "";
                         if (typeof result === 'string') tempText = result;
                         else if (result?.message?.content) tempText = result.message.content;
 
-                        if (typeof tempText === 'string' && tempText.length < 150) {
+                        if (typeof tempText === 'string') {
                             const lower = tempText.toLowerCase();
                             const errorPhrases = [
-                                "usage limit", "quota", "insufficient credit",
-                                "upgrade your plan", "reached your limit",
-                                "out of credits", "payment method",
-                                "too many requests", "rate limit"
+                                "usage limit",
+                                "quota",
+                                "insufficient credit",
+                                "reached your ai usage limit", // Specific match
+                                "upgrade your plan",
+                                "out of credits",
+                                "payment method",
+                                "rate limit"
                             ];
                             
-                            if (errorPhrases.some(phrase => lower.includes(phrase))) {
-                                throw new Error(`Token rejected (Quota detected): ${tempText}`);
+                            // Check if ANY error phrase is found
+                            const hasError = errorPhrases.some(phrase => lower.includes(phrase));
+
+                            if (hasError) {
+                                throw new Error(`Token rejected (Quota detected): ${tempText.substring(0, 100)}...`);
                             }
                         }
 
+                        // If we passed the check, it's valid!
                         response = result;
                         break; 
 
                     } catch (err) {
                         console.warn(`Token ending in ...${token.slice(-4)} failed: ${err.message}`);
                         lastError = err;
+                        // Loop continues to next token
                     }
                 }
 
