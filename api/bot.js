@@ -131,18 +131,13 @@ export default async function handler(req, res) {
                 let history = await kv.get(dbKey) || [];
                 history.push({ role: 'user', content: userMessage });
 
-                // ----------------------------------------------------
-                // 1. GET DATE (For "Today" queries)
-                // ----------------------------------------------------
+                // 1. GET DATE
                 const now = new Date();
                 const dateString = now.toLocaleDateString("en-US", { 
                     weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' 
                 });
 
-                // ----------------------------------------------------
                 // 2. ROUTER PHASE (Strict Classifier)
-                // ----------------------------------------------------
-                // This model is NOT allowed to chat. It only outputs commands.
                 const routerPrompt = `Current Date: ${dateString}
 
 You are a classification tool. You do NOT answer questions. You ONLY output a command.
@@ -156,49 +151,42 @@ Examples:
 User: "Hi" -> DIRECT_ANSWER
 User: "News on Duterte" -> SEARCH: latest news Rodrigo Duterte ${dateString}
 User: "Weather today" -> SEARCH: weather forecast ${dateString}
-User: "Who is the CEO of X?" -> SEARCH: current CEO of X
+User: "Specs of Xiaomi 17" -> SEARCH: Xiaomi 17 specs features
 User: "Write a poem" -> DIRECT_ANSWER`;
 
                 const routerMessages = [
                     { role: "system", content: routerPrompt },
-                    { role: "user", content: userMessage } // Only classify the LATEST message
+                    { role: "user", content: userMessage } 
                 ];
 
                 const routerResponse = await callClaudeWithRotation(routerMessages);
                 
                 let finalResponse = "";
 
-                // ----------------------------------------------------
                 // 3. EXECUTION PHASE
-                // ----------------------------------------------------
-                
-                // CASE A: SEARCH REQUIRED
                 if (routerResponse.trim().startsWith("SEARCH:")) {
                     const searchQuery = routerResponse.replace("SEARCH:", "").trim();
                     await bot.sendChatAction(chatId, 'typing'); 
                     
-                    // Force the search
                     const searchResults = await performTavilyResearch(searchQuery);
 
-                    // Build context for the Answerer
+                    // --- UPDATED SYSTEM INSTRUCTION FOR DIRECTNESS ---
                     const contextMsg = {
                         role: "system",
-                        content: `[SYSTEM DATA]\nDate: ${dateString}\nSearch Query: "${searchQuery}"\nResults:\n${searchResults || "No results found."}\n\nInstruction: Answer using these results. If results are empty, say so.`
+                        content: `[SYSTEM DATA]\nDate: ${dateString}\nSearch Query: "${searchQuery}"\nResults:\n${searchResults || "No results found."}\n\nInstruction: Answer the user's question directly using these results.\n\nCRITICAL STYLE RULE: Do NOT say "Based on the search results", "According to the search", or "The results show". Just state the answer directly and professionally as if you already knew it.`
                     };
 
                     const answerMessages = [
                         { role: "system", content: process.env.SYSTEM_PROMPT || "You are a helpful assistant." },
-                        ...history.slice(0, -1), // History
-                        contextMsg,              // Search Data
+                        ...history.slice(0, -1), 
+                        contextMsg,              
                         { role: "user", content: userMessage }
                     ];
 
                     finalResponse = await callClaudeWithRotation(answerMessages);
                 } 
-                
-                // CASE B: NO SEARCH (Direct Answer)
                 else {
-                    // Just call the model normally with history
+                    // Direct Answer
                     const answerMessages = [
                         { role: "system", content: process.env.SYSTEM_PROMPT || "You are a helpful assistant." },
                         ...history
@@ -206,23 +194,13 @@ User: "Write a poem" -> DIRECT_ANSWER`;
                     finalResponse = await callClaudeWithRotation(answerMessages);
                 }
 
-                // ----------------------------------------------------
-                // 4. CLEANUP & REPLY (Fix Headers)
-                // ----------------------------------------------------
+                // 4. CLEANUP & REPLY
                 let replyText = finalResponse
-                    // Fix: Convert '### Header' to '*Header*' (Bold)
-                    .replace(/^#{1,6}\s+(.*?)$/gm, '*$1*')
-                    
-                    // Fix: Convert '**Bold**' to Telegram '*Bold*'
-                    .replace(/\*\*(.*?)\*\*/g, '*$1*')
+                    .replace(/^#{1,6}\s+(.*?)$/gm, '*$1*') // Headers -> Bold
+                    .replace(/\*\*(.*?)\*\*/g, '*$1*')     // Bold -> Telegram Bold
                     .replace(/__(.*?)__/g, '*$1*')
-                    
-                    // Fix: Convert lists
-                    .replace(/^\s*-\s+/gm, '• ')
-                    
-                    // Fix: Remove horizontal lines
-                    .replace(/^\s*[-_*]{3,}\s*$/gm, '')
-                    
+                    .replace(/^\s*-\s+/gm, '• ')           // Lists -> Bullets
+                    .replace(/^\s*[-_*]{3,}\s*$/gm, '')    // Remove HRs
                     .trim();
 
                 history.push({ role: 'assistant', content: replyText });
@@ -235,7 +213,6 @@ User: "Write a poem" -> DIRECT_ANSWER`;
                 }
 
             } catch (error) {
-                // If markdown fails, send plain text
                 try {
                     await bot.sendMessage(chatId, error.message.includes('Markdown') ? finalResponse : `⚠️ Error: ${error.message}`);
                 } catch (e) { console.error(e); }
