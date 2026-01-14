@@ -20,10 +20,11 @@ async function fetchPuterTokens() {
     }
 }
 
-// --- HELPER 2: CLAUDE CALL WRAPPER (Handles Rotation & Error Detection) ---
+// --- HELPER 2: CLAUDE CALL WRAPPER (With Fixed Parsing) ---
 async function callClaudeWithRotation(messages) {
-    // 1. Get & Shuffle Tokens
     let tokens = await fetchPuterTokens();
+    
+    // Shuffle
     for (let i = tokens.length - 1; i > 0; i--) {
         const j = Math.floor(Math.random() * (i + 1));
         [tokens[i], tokens[j]] = [tokens[j], tokens[i]];
@@ -31,7 +32,6 @@ async function callClaudeWithRotation(messages) {
 
     let lastError = null;
 
-    // 2. Retry Loop
     for (const token of tokens) {
         try {
             const puter = init(token);
@@ -40,9 +40,41 @@ async function callClaudeWithRotation(messages) {
             if (!result) throw new Error("Empty response");
             if (result.error) throw new Error(JSON.stringify(result));
 
-            // Extract Text
-            let text = typeof result === 'string' ? result : result?.message?.content || "";
-            if (typeof text !== 'string') text = JSON.stringify(text);
+            // --- FIXED PARSING LOGIC ---
+            let text = "";
+
+            // Case A: Simple String
+            if (typeof result === 'string') {
+                text = result;
+            } 
+            // Case B: Object with message.content
+            else if (result?.message?.content) {
+                const content = result.message.content;
+                
+                if (typeof content === 'string') {
+                    text = content;
+                } else if (Array.isArray(content)) {
+                    // Extract text from blocks like [{ type: 'text', text: '...' }]
+                    text = content
+                        .filter(block => block.type === 'text' || block.text)
+                        .map(block => block.text || '')
+                        .join('');
+                }
+            } 
+            // Case C: Raw Array (The issue you saw)
+            else if (Array.isArray(result)) {
+                 text = result
+                    .filter(block => block.type === 'text' || block.text)
+                    .map(block => block.text || '')
+                    .join('');
+            }
+            // Case D: Fallback
+            else {
+                text = JSON.stringify(result);
+            }
+
+            // Clean up any lingering quotes or whitespace
+            text = text.trim();
 
             // Aggressive Error Detection
             if (text.length < 150) {
@@ -53,7 +85,7 @@ async function callClaudeWithRotation(messages) {
                 }
             }
 
-            return text; // Success!
+            return text;
 
         } catch (err) {
             console.warn(`Token ...${token.slice(-4)} failed: ${err.message}`);
@@ -68,7 +100,6 @@ async function performTavilyResearch(userQuery) {
     const apiKeyRaw = process.env.TAVILY_API_KEY;
     if (!apiKeyRaw) return null;
 
-    // Simple Key Rotation for Tavily
     const keys = apiKeyRaw.split(',').map(k => k.trim()).filter(Boolean);
     const apiKey = keys[Math.floor(Math.random() * keys.length)];
 
@@ -103,7 +134,6 @@ export default async function handler(req, res) {
             const userMessage = body.message.text.trim();
             const dbKey = `chat_history:${chatId}`;
 
-            // 1. Whitelist & Commands
             const allowed = (process.env.WHITELIST || "").split(',').map(i => i.trim());
             if (allowed.length > 0 && !allowed.includes(chatId.toString())) {
                 return res.status(200).json({});
@@ -121,14 +151,12 @@ export default async function handler(req, res) {
             await bot.sendChatAction(chatId, 'typing');
 
             try {
-                // 2. Load History
                 let history = await kv.get(dbKey) || [];
                 history.push({ role: 'user', content: userMessage });
 
                 // ====================================================
-                // STEP 1: DECISION PHASE (The Agent)
+                // STEP 1: DECISION PHASE
                 // ====================================================
-                // We ask Claude: "Do you need to search?"
                 const decisionMessages = [
                     { 
                         role: "system", 
@@ -140,60 +168,48 @@ export default async function handler(req, res) {
                         User: "Price of BTC" -> You: SEARCH: current price of bitcoin
                         User: "Who won the superbowl?" -> You: SEARCH: super bowl winner 2024
                         User: "Hi there" -> You: Hi! How can I help?
-                        User: "Write a poem" -> You: (Writes poem)
                         
                         Do not explain yourself. Just output the SEARCH command or the normal response.` 
                     },
-                    ...history.slice(-4) // Only look at recent context for decision to save tokens
+                    ...history.slice(-4) 
                 ];
 
-                // Call Claude (using our robust rotation helper)
                 let initialResponse = await callClaudeWithRotation(decisionMessages);
                 let finalResponse = initialResponse;
 
                 // ====================================================
-                // STEP 2: ACTION PHASE (If Search is needed)
+                // STEP 2: ACTION PHASE
                 // ====================================================
                 if (initialResponse.trim().startsWith("SEARCH:")) {
                     const searchQuery = initialResponse.replace("SEARCH:", "").trim();
-                    await bot.sendChatAction(chatId, 'typing'); // Keep typing...
+                    await bot.sendChatAction(chatId, 'typing'); 
 
-                    // Perform Search
                     const searchResults = await performTavilyResearch(searchQuery);
 
                     if (searchResults) {
-                        // Create the final prompt with the injected knowledge
                         const searchContextMsg = {
                             role: "system",
                             content: `[SYSTEM TOOL OUTPUT]\nUser requested search for: "${searchQuery}"\n\nSearch Results:\n${searchResults}\n\nInstruction: Answer the user's original question using these results.`
                         };
 
-                        // We create a new history array for the final answer generation
                         const finalMessages = [
                             { role: "system", content: process.env.SYSTEM_PROMPT || "You are a helpful assistant." },
-                            ...history.slice(0, -1), // Previous history
-                            searchContextMsg,        // Inject search results BEFORE the last user msg (or as system context)
+                            ...history.slice(0, -1), 
+                            searchContextMsg,        
                             { role: "user", content: userMessage }
                         ];
 
-                        // Call Claude again for the final answer
                         finalResponse = await callClaudeWithRotation(finalMessages);
                     }
-                } else {
-                    // If no search was needed, we just use the initial response (e.g., "Hi!", "Here is a poem...")
-                    // However, if the initial response was just "Hi", we might want to ensure we didn't miss the system prompt flavor.
-                    // But usually, Opus is smart enough to just answer directly if no search is needed.
                 }
 
                 // ====================================================
-                // STEP 3: REPLY & SAVE
+                // STEP 3: REPLY
                 // ====================================================
-                
-                // Clean markdown
                 let cleanReply = finalResponse
                     .replace(/\*\*(.*?)\*\*/g, '$1')
                     .replace(/__(.*?)__/g, '$1')
-                    .replace(/^\s*[-_*]{3,}\s*$/gm, '') // Remove horizontal rules
+                    .replace(/^\s*[-_*]{3,}\s*$/gm, '') 
                     .trim();
 
                 history.push({ role: 'assistant', content: cleanReply });
