@@ -131,22 +131,17 @@ export default async function handler(req, res) {
                 let history = await kv.get(dbKey) || [];
                 history.push({ role: 'user', content: userMessage });
 
-                // ----------------------------------------------------
-                // 1. GET CURRENT DATE
-                // ----------------------------------------------------
+                // 1. GET DATE
                 const now = new Date();
                 const dateString = now.toLocaleDateString("en-US", { 
                     weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' 
                 });
 
-                // ----------------------------------------------------
-                // 2. DECISION PHASE (With Date Injection)
-                // ----------------------------------------------------
+                // 2. DECISION PHASE
                 const decisionMessages = [
                     { 
                         role: "system", 
                         content: `Current Date: ${dateString}
-                        
                         You are a helpful assistant with a Web Search tool.
                         
                         You MUST trigger a search if:
@@ -154,14 +149,12 @@ export default async function handler(req, res) {
                         2. The query implies current data ("Today", "Now", "Latest").
                         3. You do not know the answer.
                         
-                        IMPORTANT: When searching for "Today" or "Current", replace those words with the specific date (${dateString}) to get accurate results.
-                        
+                        When searching for "Today", use the date ${dateString}.
                         Reply ONLY with: SEARCH: <concise_search_query>
                         
                         Examples:
                         User: "LPA in PAR today?" -> You: SEARCH: Low Pressure Area Philippines ${dateString}
                         User: "Bitcoin price" -> You: SEARCH: Bitcoin price ${dateString}
-                        User: "Who won the game?" -> You: SEARCH: sports results ${dateString}
                         
                         If no search is needed, answer normally.` 
                     },
@@ -171,9 +164,7 @@ export default async function handler(req, res) {
                 let initialResponse = await callClaudeWithRotation(decisionMessages);
                 let finalResponse = initialResponse;
 
-                // ----------------------------------------------------
                 // 3. ACTION PHASE
-                // ----------------------------------------------------
                 if (initialResponse.trim().startsWith("SEARCH:")) {
                     const searchQuery = initialResponse.replace("SEARCH:", "").trim();
                     await bot.sendChatAction(chatId, 'typing'); 
@@ -197,12 +188,21 @@ export default async function handler(req, res) {
                     }
                 }
 
-                // ----------------------------------------------------
-                // 4. REPLY
-                // ----------------------------------------------------
+                // 4. CLEANUP & REPLY (FIXED FORMATTING)
                 let replyText = finalResponse
-                    .replace(/\*\*(.*?)\*\*/g, '*$1*') 
-                    .replace(/__(.*?)__/g, '*$1*')     
+                    // Convert Headers (## Title) to Bold (*Title*)
+                    .replace(/^#{1,6}\s+(.*?)$/gm, '*$1*')
+                    
+                    // Convert Bold (**text**) to Telegram Bold (*text*)
+                    .replace(/\*\*(.*?)\*\*/g, '*$1*')
+                    .replace(/__(.*?)__/g, '*$1*')
+                    
+                    // Convert Bullet points
+                    .replace(/^\s*-\s+/gm, '• ')
+                    
+                    // Remove horizontal rules
+                    .replace(/^\s*[-_*]{3,}\s*$/gm, '')
+                    
                     .trim();
 
                 history.push({ role: 'assistant', content: replyText });
@@ -216,7 +216,8 @@ export default async function handler(req, res) {
 
             } catch (error) {
                 try {
-                    await bot.sendMessage(chatId, error.message.includes('Markdown') ? finalResponse : `⚠️ Error: ${error.message}`);
+                    // Fallback to plain text if markdown fails
+                    await bot.sendMessage(chatId, finalResponse); 
                 } catch (e) { console.error(e); }
             }
         }
