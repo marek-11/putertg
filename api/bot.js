@@ -4,10 +4,9 @@ const { kv } = require('@vercel/kv');
 const { init } = require('@heyputer/puter.js/src/init.cjs');
 
 // --- CONFIGURATION ---
-// The requested default model. Changing this updates the "fallback".
 const DEFAULT_MODEL = 'claude-opus-4-5'; 
 
-// --- HELPER 1: CLAUDE CALL WRAPPER (Now accepts modelId) ---
+// --- HELPER 1: CLAUDE CALL WRAPPER ---
 async function callClaudeWithRotation(messages, modelId = DEFAULT_MODEL) {
     const rawTokens = process.env.PUTER_AUTH_TOKEN;
     if (!rawTokens) throw new Error("Missing PUTER_AUTH_TOKEN env var.");
@@ -25,7 +24,6 @@ async function callClaudeWithRotation(messages, modelId = DEFAULT_MODEL) {
     for (const token of tokens) {
         try {
             const puter = init(token);
-            // Use the requested modelId
             const result = await puter.ai.chat(messages, { model: modelId });
 
             if (!result) throw new Error("Empty response");
@@ -100,8 +98,6 @@ export default async function handler(req, res) {
         if (body.message && body.message.text) {
             const chatId = body.message.chat.id;
             const userMessage = body.message.text.trim();
-            
-            // KV Keys
             const dbKey = `chat_history:${chatId}`;
             const modelKey = `model_pref:${chatId}`;
 
@@ -123,7 +119,7 @@ export default async function handler(req, res) {
                 return res.status(200).json({});
             }
 
-            // NEW: Switch Model
+            // SWITCH MODEL
             if (userMessage.startsWith('/use')) {
                 const newModel = userMessage.replace('/use', '').trim();
                 if (!newModel) {
@@ -135,25 +131,24 @@ export default async function handler(req, res) {
                 return res.status(200).json({});
             }
 
-            // NEW: Reset Model
+            // RESET MODEL
             if (userMessage === '/reset') {
                 await kv.del(modelKey);
                 await bot.sendMessage(chatId, `🔄 Reverted to default: \`${DEFAULT_MODEL}\``, {parse_mode: 'Markdown'});
                 return res.status(200).json({});
             }
 
-            // NEW: Check Current Model
+            // CURRENT MODEL
             if (userMessage === '/current') {
                 const current = await kv.get(modelKey) || DEFAULT_MODEL;
                 await bot.sendMessage(chatId, `🧠 Current Model: \`${current}\``, {parse_mode: 'Markdown'});
                 return res.status(200).json({});
             }
 
-            // COMMAND: /credits
+            // CREDITS
             if (userMessage === '/credits') {
                 try {
                     await bot.sendChatAction(chatId, 'typing');
-                    
                     const rawTokens = process.env.PUTER_AUTH_TOKEN;
                     if (!rawTokens) {
                         await bot.sendMessage(chatId, "⚠️ No PUTER_AUTH_TOKEN configured.");
@@ -167,7 +162,6 @@ export default async function handler(req, res) {
                     for (let i = 0; i < tokens.length; i++) {
                         const token = tokens[i];
                         const mask = `${token.slice(0, 4)}...${token.slice(-4)}`;
-                        
                         try {
                             const puter = init(token);
                             let username = "Unknown";
@@ -188,7 +182,6 @@ export default async function handler(req, res) {
                             } catch (e) {
                                 console.log('Usage fetch failed', e);
                             }
-
                             report += `*Token ${i + 1}* (${mask})\n`;
                             report += `• User: \`${username}\`\n`;
                             report += `• Available: *${balanceStr}*\n\n`;
@@ -199,14 +192,13 @@ export default async function handler(req, res) {
                     report += `-----------------------------\n`;
                     report += `*💰 TOTAL BALANCE: $${grandTotal.toFixed(2)}*`;
                     await bot.sendMessage(chatId, report, { parse_mode: 'Markdown' });
-
                 } catch (fatalError) {
                     await bot.sendMessage(chatId, "⚠️ Error checking credits.");
                 }
                 return res.status(200).json({});
             }
 
-            // COMMAND: /models
+            // COMMAND: /models (FIXED CRASH LOGIC)
             if (userMessage === '/models') {
                 try {
                     await bot.sendChatAction(chatId, 'typing');
@@ -217,6 +209,7 @@ export default async function handler(req, res) {
                     const puter = init(token);
                     const models = await puter.ai.listModels();
                     
+                    // Group by Provider
                     const grouped = {};
                     models.forEach(m => {
                         const provider = m.provider || 'Other';
@@ -224,19 +217,46 @@ export default async function handler(req, res) {
                         grouped[provider].push(m.id);
                     });
 
-                    let message = `*🤖 Available AI Models*\nUse /use <name> to switch.\n`;
-                    Object.keys(grouped).sort().forEach(provider => {
-                        message += `\n*${provider.toUpperCase()}*\n`;
-                        const list = grouped[provider].sort();
-                        list.forEach(id => {
-                            message += `• \`${id}\`\n`;
-                        });
-                    });
+                    // SAFE SEND FUNCTION
+                    // We build the message line by line. If a line makes it too big, we send the chunk.
+                    const sendChunk = async (text) => {
+                        if (!text.trim()) return;
+                        await bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
+                    };
 
-                    const MAX_CHUNK = 4000;
-                    for (let i = 0; i < message.length; i += MAX_CHUNK) {
-                        await bot.sendMessage(chatId, message.substring(i, i + MAX_CHUNK), { parse_mode: 'Markdown' });
+                    let currentBuffer = `*🤖 Available AI Models*\nUse /use <name> to switch.\n`;
+                    const MAX_SAFE_LENGTH = 3500; // Leave buffer for formatting overhead
+
+                    const providers = Object.keys(grouped).sort();
+                    
+                    for (const provider of providers) {
+                        const header = `\n*${provider.toUpperCase()}*\n`;
+                        
+                        // Check if header fits, else flush
+                        if (currentBuffer.length + header.length > MAX_SAFE_LENGTH) {
+                            await sendChunk(currentBuffer);
+                            currentBuffer = "";
+                        }
+                        currentBuffer += header;
+
+                        // Add models
+                        const list = grouped[provider].sort();
+                        for (const id of list) {
+                            // Escape underscores to prevent markdown errors (e.g. stable_diffusion)
+                            const safeId = id.replace(/_/g, '\\_');
+                            const line = `• ${safeId}\n`;
+
+                            if (currentBuffer.length + line.length > MAX_SAFE_LENGTH) {
+                                await sendChunk(currentBuffer);
+                                currentBuffer = "";
+                            }
+                            currentBuffer += line;
+                        }
                     }
+
+                    // Send remaining buffer
+                    await sendChunk(currentBuffer);
+
                 } catch (e) {
                     await bot.sendMessage(chatId, `⚠️ Could not fetch models: ${e.message}`);
                 }
@@ -250,8 +270,6 @@ export default async function handler(req, res) {
                 let history = await kv.get(dbKey) || [];
                 history.push({ role: 'user', content: userMessage });
 
-                // 1. DETERMINE MODEL TO USE
-                // We check if the user has a custom model set in KV. If not, use DEFAULT_MODEL.
                 const userModelPref = await kv.get(modelKey);
                 const activeModel = userModelPref || DEFAULT_MODEL;
 
@@ -260,7 +278,6 @@ export default async function handler(req, res) {
                     weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' 
                 });
 
-                // 2. ROUTER PHASE (Always uses DEFAULT_MODEL for stability)
                 const routerPrompt = `Current Date: ${dateString}
 
 You are a classification tool. Look at the CONVERSATION HISTORY.
@@ -282,13 +299,11 @@ User: "Write a poem" -> DIRECT_ANSWER`;
                     ...history.slice(-3) 
                 ];
 
-                // NOTE: Router always uses default model to ensure consistent logic
                 const routerResponse = await callClaudeWithRotation(routerMessages, DEFAULT_MODEL);
                 
                 let finalResponse = "";
                 let hiddenSearchData = ""; 
 
-                // 3. EXECUTION PHASE (Uses activeModel)
                 if (routerResponse.trim().startsWith("SEARCH:")) {
                     const searchQuery = routerResponse.replace("SEARCH:", "").trim();
                     await bot.sendChatAction(chatId, 'typing'); 
@@ -311,7 +326,6 @@ User: "Write a poem" -> DIRECT_ANSWER`;
                         { role: "user", content: userMessage }
                     ];
 
-                    // CALL AI WITH USER'S CHOSEN MODEL
                     finalResponse = await callClaudeWithRotation(answerMessages, activeModel);
                 } 
                 else {
@@ -323,11 +337,9 @@ User: "Write a poem" -> DIRECT_ANSWER`;
                         ...history
                     ];
                     
-                    // CALL AI WITH USER'S CHOSEN MODEL
                     finalResponse = await callClaudeWithRotation(answerMessages, activeModel);
                 }
 
-                // 4. CLEANUP & REPLY
                 let cleanReply = finalResponse
                     .replace(/^#{1,6}\s+(.*?)$/gm, '*$1*') 
                     .replace(/\*\*(.*?)\*\*/g, '*$1*')    
@@ -336,7 +348,6 @@ User: "Write a poem" -> DIRECT_ANSWER`;
                     .replace(/^\s*[-_*]{3,}\s*$/gm, '')    
                     .trim();
 
-                // Append search data to DB (hidden)
                 const dbContent = cleanReply + hiddenSearchData;
                 history.push({ role: 'assistant', content: dbContent });
                 
