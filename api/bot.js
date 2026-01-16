@@ -3,8 +3,12 @@ const TelegramBot = require('node-telegram-bot-api');
 const { kv } = require('@vercel/kv');
 const { init } = require('@heyputer/puter.js/src/init.cjs');
 
-// --- HELPER 1: CLAUDE CALL WRAPPER ---
-async function callClaudeWithRotation(messages) {
+// --- CONFIGURATION ---
+// The requested default model. Changing this updates the "fallback".
+const DEFAULT_MODEL = 'claude-opus-4-5'; 
+
+// --- HELPER 1: CLAUDE CALL WRAPPER (Now accepts modelId) ---
+async function callClaudeWithRotation(messages, modelId = DEFAULT_MODEL) {
     const rawTokens = process.env.PUTER_AUTH_TOKEN;
     if (!rawTokens) throw new Error("Missing PUTER_AUTH_TOKEN env var.");
 
@@ -21,7 +25,8 @@ async function callClaudeWithRotation(messages) {
     for (const token of tokens) {
         try {
             const puter = init(token);
-            const result = await puter.ai.chat(messages, { model: 'claude-opus-4-5' });
+            // Use the requested modelId
+            const result = await puter.ai.chat(messages, { model: modelId });
 
             if (!result) throw new Error("Empty response");
             if (result.error) throw new Error(JSON.stringify(result));
@@ -51,7 +56,7 @@ async function callClaudeWithRotation(messages) {
             }
             return text;
         } catch (err) {
-            console.warn(`Token ...${token.slice(-4)} failed: ${err.message}`);
+            console.warn(`Token ...${token.slice(-4)} failed on ${modelId}: ${err.message}`);
             lastError = err;
         }
     }
@@ -95,23 +100,56 @@ export default async function handler(req, res) {
         if (body.message && body.message.text) {
             const chatId = body.message.chat.id;
             const userMessage = body.message.text.trim();
+            
+            // KV Keys
             const dbKey = `chat_history:${chatId}`;
+            const modelKey = `model_pref:${chatId}`;
 
             const allowed = (process.env.WHITELIST || "").split(',').map(i => i.trim());
             if (allowed.length > 0 && !allowed.includes(chatId.toString())) {
                 return res.status(200).json({});
             }
+
+            // --- COMMANDS ---
+
             if (userMessage === '/start') {
                 await bot.sendMessage(chatId, "Hi! I am ready.");
                 return res.status(200).json({});
             }
+            
             if (userMessage === '/clear') {
                 await kv.set(dbKey, []);
                 await bot.sendMessage(chatId, "✅ Memory cleared.");
                 return res.status(200).json({});
             }
 
-            // --- COMMAND: /credits (UPDATED) ---
+            // NEW: Switch Model
+            if (userMessage.startsWith('/use')) {
+                const newModel = userMessage.replace('/use', '').trim();
+                if (!newModel) {
+                    await bot.sendMessage(chatId, "⚠️ Please specify a model name. Example: `/use gpt-4o`", {parse_mode: 'Markdown'});
+                    return res.status(200).json({});
+                }
+                await kv.set(modelKey, newModel);
+                await bot.sendMessage(chatId, `✅ Switched model to: \`${newModel}\``, {parse_mode: 'Markdown'});
+                return res.status(200).json({});
+            }
+
+            // NEW: Reset Model
+            if (userMessage === '/reset') {
+                await kv.del(modelKey);
+                await bot.sendMessage(chatId, `🔄 Reverted to default: \`${DEFAULT_MODEL}\``, {parse_mode: 'Markdown'});
+                return res.status(200).json({});
+            }
+
+            // NEW: Check Current Model
+            if (userMessage === '/current') {
+                const current = await kv.get(modelKey) || DEFAULT_MODEL;
+                await bot.sendMessage(chatId, `🧠 Current Model: \`${current}\``, {parse_mode: 'Markdown'});
+                return res.status(200).json({});
+            }
+
+            // COMMAND: /credits
             if (userMessage === '/credits') {
                 try {
                     await bot.sendChatAction(chatId, 'typing');
@@ -132,28 +170,19 @@ export default async function handler(req, res) {
                         
                         try {
                             const puter = init(token);
-                            
-                            // 1. Get Username
                             let username = "Unknown";
                             try {
                                 const user = await puter.auth.getUser();
                                 username = user.username || "Unknown";
                             } catch (e) {}
 
-                            // 2. Get Balance via MonthlyUsage (Microcents)
                             let balanceStr = "N/A";
-
                             try {
                                 const usageData = await puter.auth.getMonthlyUsage();
-                                
                                 if (usageData && usageData.allowanceInfo) {
-                                    // Formula: microcents / 100,000,000 = USD
                                     const remainingMicro = usageData.allowanceInfo.remaining || 0;
                                     const remainingUSD = remainingMicro / 100000000;
-                                    
                                     balanceStr = `$${remainingUSD.toFixed(2)}`;
-                                    
-                                    // Add to Grand Total
                                     grandTotal += remainingUSD;
                                 }
                             } catch (e) {
@@ -163,39 +192,75 @@ export default async function handler(req, res) {
                             report += `*Token ${i + 1}* (${mask})\n`;
                             report += `• User: \`${username}\`\n`;
                             report += `• Available: *${balanceStr}*\n\n`;
-
                         } catch (e) {
                             report += `*Token ${i + 1}* (${mask})\n• ⚠️ Error: Invalid Token\n\n`;
                         }
                     }
-                    
-                    // Add Total Balance Footer
                     report += `-----------------------------\n`;
                     report += `*💰 TOTAL BALANCE: $${grandTotal.toFixed(2)}*`;
-
                     await bot.sendMessage(chatId, report, { parse_mode: 'Markdown' });
 
                 } catch (fatalError) {
-                    console.error("Credits command crashed:", fatalError);
-                    try {
-                         await bot.sendMessage(chatId, "⚠️ Error checking credits.");
-                    } catch(e) {}
+                    await bot.sendMessage(chatId, "⚠️ Error checking credits.");
                 }
-                
                 return res.status(200).json({});
             }
 
+            // COMMAND: /models
+            if (userMessage === '/models') {
+                try {
+                    await bot.sendChatAction(chatId, 'typing');
+                    
+                    const rawTokens = process.env.PUTER_AUTH_TOKEN;
+                    if (!rawTokens) throw new Error("No Tokens");
+                    const token = rawTokens.split(',')[0].trim();
+                    const puter = init(token);
+                    const models = await puter.ai.listModels();
+                    
+                    const grouped = {};
+                    models.forEach(m => {
+                        const provider = m.provider || 'Other';
+                        if (!grouped[provider]) grouped[provider] = [];
+                        grouped[provider].push(m.id);
+                    });
+
+                    let message = `*🤖 Available AI Models*\nUse /use <name> to switch.\n`;
+                    Object.keys(grouped).sort().forEach(provider => {
+                        message += `\n*${provider.toUpperCase()}*\n`;
+                        const list = grouped[provider].sort();
+                        list.forEach(id => {
+                            message += `• \`${id}\`\n`;
+                        });
+                    });
+
+                    const MAX_CHUNK = 4000;
+                    for (let i = 0; i < message.length; i += MAX_CHUNK) {
+                        await bot.sendMessage(chatId, message.substring(i, i + MAX_CHUNK), { parse_mode: 'Markdown' });
+                    }
+                } catch (e) {
+                    await bot.sendMessage(chatId, `⚠️ Could not fetch models: ${e.message}`);
+                }
+                return res.status(200).json({});
+            }
+
+            // --- NORMAL CHAT FLOW ---
             await bot.sendChatAction(chatId, 'typing');
 
             try {
                 let history = await kv.get(dbKey) || [];
                 history.push({ role: 'user', content: userMessage });
 
+                // 1. DETERMINE MODEL TO USE
+                // We check if the user has a custom model set in KV. If not, use DEFAULT_MODEL.
+                const userModelPref = await kv.get(modelKey);
+                const activeModel = userModelPref || DEFAULT_MODEL;
+
                 const now = new Date();
                 const dateString = now.toLocaleDateString("en-US", { 
                     weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' 
                 });
 
+                // 2. ROUTER PHASE (Always uses DEFAULT_MODEL for stability)
                 const routerPrompt = `Current Date: ${dateString}
 
 You are a classification tool. Look at the CONVERSATION HISTORY.
@@ -217,11 +282,13 @@ User: "Write a poem" -> DIRECT_ANSWER`;
                     ...history.slice(-3) 
                 ];
 
-                const routerResponse = await callClaudeWithRotation(routerMessages);
+                // NOTE: Router always uses default model to ensure consistent logic
+                const routerResponse = await callClaudeWithRotation(routerMessages, DEFAULT_MODEL);
                 
                 let finalResponse = "";
                 let hiddenSearchData = ""; 
 
+                // 3. EXECUTION PHASE (Uses activeModel)
                 if (routerResponse.trim().startsWith("SEARCH:")) {
                     const searchQuery = routerResponse.replace("SEARCH:", "").trim();
                     await bot.sendChatAction(chatId, 'typing'); 
@@ -244,7 +311,8 @@ User: "Write a poem" -> DIRECT_ANSWER`;
                         { role: "user", content: userMessage }
                     ];
 
-                    finalResponse = await callClaudeWithRotation(answerMessages);
+                    // CALL AI WITH USER'S CHOSEN MODEL
+                    finalResponse = await callClaudeWithRotation(answerMessages, activeModel);
                 } 
                 else {
                     const systemPrompt = (process.env.SYSTEM_PROMPT || "You are a helpful assistant.") + 
@@ -254,9 +322,12 @@ User: "Write a poem" -> DIRECT_ANSWER`;
                         { role: "system", content: systemPrompt },
                         ...history
                     ];
-                    finalResponse = await callClaudeWithRotation(answerMessages);
+                    
+                    // CALL AI WITH USER'S CHOSEN MODEL
+                    finalResponse = await callClaudeWithRotation(answerMessages, activeModel);
                 }
 
+                // 4. CLEANUP & REPLY
                 let cleanReply = finalResponse
                     .replace(/^#{1,6}\s+(.*?)$/gm, '*$1*') 
                     .replace(/\*\*(.*?)\*\*/g, '*$1*')    
@@ -265,8 +336,8 @@ User: "Write a poem" -> DIRECT_ANSWER`;
                     .replace(/^\s*[-_*]{3,}\s*$/gm, '')    
                     .trim();
 
+                // Append search data to DB (hidden)
                 const dbContent = cleanReply + hiddenSearchData;
-
                 history.push({ role: 'assistant', content: dbContent });
                 
                 if (history.length > 20) history = history.slice(-20);
