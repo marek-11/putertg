@@ -8,10 +8,9 @@ async function callClaudeWithRotation(messages) {
     const rawTokens = process.env.PUTER_AUTH_TOKEN;
     if (!rawTokens) throw new Error("Missing PUTER_AUTH_TOKEN env var.");
 
-    // Split by comma to support multiple tokens
     let tokens = rawTokens.split(',').map(t => t.trim()).filter(t => t.length > 0);
     
-    // Shuffle for load balancing
+    // Shuffle
     for (let i = tokens.length - 1; i > 0; i--) {
         const j = Math.floor(Math.random() * (i + 1));
         [tokens[i], tokens[j]] = [tokens[j], tokens[i]];
@@ -43,7 +42,6 @@ async function callClaudeWithRotation(messages) {
             }
             text = text.trim();
 
-            // Simple quota check based on error text
             if (text.length < 150) {
                 const lower = text.toLowerCase();
                 const failPhrases = ["usage limit", "quota", "insufficient credit", "out of credits", "rate limit"];
@@ -99,26 +97,21 @@ export default async function handler(req, res) {
             const userMessage = body.message.text.trim();
             const dbKey = `chat_history:${chatId}`;
 
-            // 1. Whitelist Check
             const allowed = (process.env.WHITELIST || "").split(',').map(i => i.trim());
             if (allowed.length > 0 && !allowed.includes(chatId.toString())) {
                 return res.status(200).json({});
             }
-
-            // 2. Command: /start
             if (userMessage === '/start') {
                 await bot.sendMessage(chatId, "Hi! I am ready.");
                 return res.status(200).json({});
             }
-
-            // 3. Command: /clear
             if (userMessage === '/clear') {
                 await kv.set(dbKey, []);
                 await bot.sendMessage(chatId, "✅ Memory cleared.");
                 return res.status(200).json({});
             }
 
-            // 4. Command: /credits (NEW)
+            // --- COMMAND: /credits (UPDATED) ---
             if (userMessage === '/credits') {
                 await bot.sendChatAction(chatId, 'typing');
                 
@@ -137,16 +130,35 @@ export default async function handler(req, res) {
                     
                     try {
                         const puter = init(token);
-                        // Fetch user info
-                        const user = await puter.auth.getUser();
                         
-                        // Check for balance/credits fields (API structure may vary)
-                        const balance = user.balance !== undefined ? user.balance : (user.account_balance || "N/A");
+                        // 1. Get Basic User Info
+                        const user = await puter.auth.getUser();
                         const username = user.username || "Unknown";
+
+                        // 2. Try to Get Usage/Financial Info
+                        // Note: documentation suggests getMonthlyUsage() exists on auth or root.
+                        let balanceDisplay = "N/A";
+                        
+                        try {
+                            // Attempt to fetch usage data if available
+                            if (typeof puter.auth.getMonthlyUsage === 'function') {
+                                const usage = await puter.auth.getMonthlyUsage();
+                                // Format usage object into a readable string
+                                const spent = usage.total_cost || usage.cost || usage.amount || 0;
+                                const currency = usage.currency || "USD";
+                                balanceDisplay = `${spent} ${currency} (Used this month)`;
+                            } else if (user.balance !== undefined) {
+                                balanceDisplay = user.balance;
+                            } else if (user.account_balance !== undefined) {
+                                balanceDisplay = user.account_balance;
+                            }
+                        } catch (err) {
+                            balanceDisplay = "Usage data inaccessible";
+                        }
                         
                         report += `*Token ${i + 1}* (${mask})\n`;
                         report += `• User: \`${username}\`\n`;
-                        report += `• Balance: ${balance}\n\n`;
+                        report += `• Status: ${balanceDisplay}\n\n`;
                     } catch (e) {
                         report += `*Token ${i + 1}* (${mask})\n• ⚠️ Error: Invalid or Expired\n\n`;
                     }
@@ -156,7 +168,6 @@ export default async function handler(req, res) {
                 return res.status(200).json({});
             }
 
-            // 5. Normal Chat Flow
             await bot.sendChatAction(chatId, 'typing');
 
             try {
@@ -168,7 +179,6 @@ export default async function handler(req, res) {
                     weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' 
                 });
 
-                // Router Phase
                 const routerPrompt = `Current Date: ${dateString}
 
 You are a classification tool. Look at the CONVERSATION HISTORY.
@@ -177,13 +187,7 @@ You are a classification tool. Look at the CONVERSATION HISTORY.
 2. Is the user asking a FOLLOW-UP, CHALLENGE, or CLARIFICATION about a previous topic?
 
 - YES -> Output: SEARCH: <query with date>
-- NO  -> Output: DIRECT_ANSWER
-
-Examples:
-User: "News on Duterte" -> SEARCH: latest news Rodrigo Duterte ${dateString}
-User: "That doesn't make sense" (Context: Stranger Things) -> SEARCH: Stranger Things plot explanation logic
-User: "Why?" (Context: Stocks) -> SEARCH: reasons for stock market drop ${dateString}
-User: "Write a poem" -> DIRECT_ANSWER`;
+- NO  -> Output: DIRECT_ANSWER`;
 
                 const routerMessages = [
                     { role: "system", content: routerPrompt },
@@ -205,7 +209,6 @@ User: "Write a poem" -> DIRECT_ANSWER`;
                         hiddenSearchData = `\n\n:::SEARCH_CONTEXT:::\nQuery: ${searchQuery}\n${searchResults}\n:::END_SEARCH_CONTEXT:::`;
                     }
 
-                    // STRICT NO TABLES RULE
                     const contextMsg = {
                         role: "system",
                         content: `[SYSTEM DATA]\nDate: ${dateString}\nSearch Query: "${searchQuery}"\nResults:\n${searchResults || "No results found."}\n\nInstruction: Answer the user's question directly using these results.\n\nCRITICAL STYLE RULE: Do NOT say "Based on the search results". Answer confidently. STRICTLY NO MARKDOWN TABLES. Use bullet points or plain text lists instead.`
@@ -221,7 +224,6 @@ User: "Write a poem" -> DIRECT_ANSWER`;
                     finalResponse = await callClaudeWithRotation(answerMessages);
                 } 
                 else {
-                    // STRICT NO TABLES RULE
                     const systemPrompt = (process.env.SYSTEM_PROMPT || "You are a helpful assistant.") + 
                                          "\n\nSTRICT OUTPUT RULE: Do NOT use Markdown tables. Use bullet points or plain text formats only.";
 
@@ -232,7 +234,6 @@ User: "Write a poem" -> DIRECT_ANSWER`;
                     finalResponse = await callClaudeWithRotation(answerMessages);
                 }
 
-                // Cleanup & Reply
                 let cleanReply = finalResponse
                     .replace(/^#{1,6}\s+(.*?)$/gm, '*$1*') 
                     .replace(/\*\*(.*?)\*\*/g, '*$1*')    
