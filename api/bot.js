@@ -111,7 +111,7 @@ export default async function handler(req, res) {
                 return res.status(200).json({});
             }
 
-            // --- COMMAND: /credits (FORMATTING UPDATE) ---
+            // --- COMMAND: /credits (DIRECT API VERSION) ---
             if (userMessage === '/credits') {
                 await bot.sendChatAction(chatId, 'typing');
                 
@@ -129,42 +129,34 @@ export default async function handler(req, res) {
                     const mask = `${token.slice(0, 4)}...${token.slice(-4)}`;
                     
                     try {
-                        const puter = init(token);
-                        
-                        // 1. Get Basic User Info
-                        const user = await puter.auth.getUser();
-                        const username = user.username || "Unknown";
-
-                        // 2. Try to Get Usage/Financial Info
-                        let balanceDisplay = "N/A";
-                        
-                        try {
-                            if (typeof puter.auth.getMonthlyUsage === 'function') {
-                                const usage = await puter.auth.getMonthlyUsage();
-                                
-                                // FORMATTING FIX: Parse float and force 2 decimals
-                                const rawVal = usage.total_cost || usage.cost || usage.amount || 0;
-                                const cost = parseFloat(rawVal).toFixed(2); // e.g., "0.25" or "0.00"
-                                const currency = usage.currency || "USD";
-                                
-                                balanceDisplay = `$${cost} ${currency} (Used this month)`;
-                            } else if (user.balance !== undefined) {
-                                // Fallback for static balance fields
-                                const bal = parseFloat(user.balance || 0).toFixed(2);
-                                balanceDisplay = `$${bal}`;
-                            } else if (user.account_balance !== undefined) {
-                                const bal = parseFloat(user.account_balance || 0).toFixed(2);
-                                balanceDisplay = `$${bal}`;
+                        // DIRECT API CALL: Bypasses library caching issues
+                        const response = await fetch('https://api.puter.com/users/me', {
+                            method: 'GET',
+                            headers: {
+                                'Authorization': `Bearer ${token}`,
+                                'Content-Type': 'application/json'
                             }
-                        } catch (err) {
-                            balanceDisplay = "Usage data inaccessible";
-                        }
+                        });
+
+                        if (!response.ok) throw new Error(`API Error: ${response.status}`);
+                        const user = await response.json();
+
+                        // EXTRACT DATA
+                        const username = user.username || "Unknown";
+                        
+                        // Try various balance fields returned by the raw API
+                        let rawBalance = 0;
+                        if (user.account_balance !== undefined) rawBalance = user.account_balance;
+                        else if (user.balance !== undefined) rawBalance = user.balance;
+                        
+                        // Ensure 2 decimal places (e.g., "0.50")
+                        const balanceDisplay = `$${parseFloat(rawBalance).toFixed(2)}`;
                         
                         report += `*Token ${i + 1}* (${mask})\n`;
                         report += `• User: \`${username}\`\n`;
-                        report += `• Status: ${balanceDisplay}\n\n`;
+                        report += `• Balance: ${balanceDisplay}\n\n`;
                     } catch (e) {
-                        report += `*Token ${i + 1}* (${mask})\n• ⚠️ Error: Invalid or Expired\n\n`;
+                        report += `*Token ${i + 1}* (${mask})\n• ⚠️ Error: Fetch Failed (${e.message})\n\n`;
                     }
                 }
                 
@@ -191,7 +183,13 @@ You are a classification tool. Look at the CONVERSATION HISTORY.
 2. Is the user asking a FOLLOW-UP, CHALLENGE, or CLARIFICATION about a previous topic?
 
 - YES -> Output: SEARCH: <query with date>
-- NO  -> Output: DIRECT_ANSWER`;
+- NO  -> Output: DIRECT_ANSWER
+
+Examples:
+User: "News on Duterte" -> SEARCH: latest news Rodrigo Duterte ${dateString}
+User: "That doesn't make sense" (Context: Stranger Things) -> SEARCH: Stranger Things plot explanation logic
+User: "Why?" (Context: Stocks) -> SEARCH: reasons for stock market drop ${dateString}
+User: "Write a poem" -> DIRECT_ANSWER`;
 
                 const routerMessages = [
                     { role: "system", content: routerPrompt },
