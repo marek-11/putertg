@@ -111,7 +111,7 @@ export default async function handler(req, res) {
                 return res.status(200).json({});
             }
 
-            // --- COMMAND: /credits (UPDATED) ---
+            // --- COMMAND: /credits (FORMATTING UPDATE) ---
             if (userMessage === '/credits') {
                 await bot.sendChatAction(chatId, 'typing');
                 
@@ -136,21 +136,25 @@ export default async function handler(req, res) {
                         const username = user.username || "Unknown";
 
                         // 2. Try to Get Usage/Financial Info
-                        // Note: documentation suggests getMonthlyUsage() exists on auth or root.
                         let balanceDisplay = "N/A";
                         
                         try {
-                            // Attempt to fetch usage data if available
                             if (typeof puter.auth.getMonthlyUsage === 'function') {
                                 const usage = await puter.auth.getMonthlyUsage();
-                                // Format usage object into a readable string
-                                const spent = usage.total_cost || usage.cost || usage.amount || 0;
+                                
+                                // FORMATTING FIX: Parse float and force 2 decimals
+                                const rawVal = usage.total_cost || usage.cost || usage.amount || 0;
+                                const cost = parseFloat(rawVal).toFixed(2); // e.g., "0.25" or "0.00"
                                 const currency = usage.currency || "USD";
-                                balanceDisplay = `${spent} ${currency} (Used this month)`;
+                                
+                                balanceDisplay = `$${cost} ${currency} (Used this month)`;
                             } else if (user.balance !== undefined) {
-                                balanceDisplay = user.balance;
+                                // Fallback for static balance fields
+                                const bal = parseFloat(user.balance || 0).toFixed(2);
+                                balanceDisplay = `$${bal}`;
                             } else if (user.account_balance !== undefined) {
-                                balanceDisplay = user.account_balance;
+                                const bal = parseFloat(user.account_balance || 0).toFixed(2);
+                                balanceDisplay = `$${bal}`;
                             }
                         } catch (err) {
                             balanceDisplay = "Usage data inaccessible";
