@@ -6,12 +6,31 @@ const { init } = require('@heyputer/puter.js/src/init.cjs');
 // --- CONFIGURATION ---
 const DEFAULT_MODEL = 'claude-opus-4-5'; 
 
-// --- HELPER 1: CLAUDE CALL WRAPPER ---
-async function callClaudeWithRotation(messages, modelId = DEFAULT_MODEL) {
-    const rawTokens = process.env.PUTER_AUTH_TOKEN;
-    if (!rawTokens) throw new Error("Missing PUTER_AUTH_TOKEN env var.");
+// --- HELPER 1: GET ALL TOKENS (ENV + DB) ---
+async function getAllTokens() {
+    // 1. Static from Env
+    const rawStatic = process.env.PUTER_AUTH_TOKEN || "";
+    const staticTokens = rawStatic.split(',').map(t => t.trim()).filter(t => t.length > 0);
 
-    let tokens = rawTokens.split(',').map(t => t.trim()).filter(t => t.length > 0);
+    // 2. Dynamic from KV (Database)
+    let dynamicTokens = [];
+    try {
+        dynamicTokens = await kv.get('extra_tokens') || [];
+        if (!Array.isArray(dynamicTokens)) dynamicTokens = [];
+    } catch (e) {
+        console.warn("KV Token fetch failed:", e);
+    }
+
+    // 3. Merge & Deduplicate
+    const combined = [...new Set([...staticTokens, ...dynamicTokens])];
+    if (combined.length === 0) throw new Error("No PUTER_AUTH_TOKEN found in Env or DB.");
+    return combined;
+}
+
+// --- HELPER 2: CLAUDE CALL WRAPPER ---
+async function callClaudeWithRotation(messages, modelId = DEFAULT_MODEL) {
+    // Fetch merged pool of tokens
+    let tokens = await getAllTokens();
     
     // Shuffle
     for (let i = tokens.length - 1; i > 0; i--) {
@@ -61,7 +80,7 @@ async function callClaudeWithRotation(messages, modelId = DEFAULT_MODEL) {
     throw new Error(`All tokens failed. Last error: ${lastError?.message}`);
 }
 
-// --- HELPER 2: TAVILY RESEARCHER ---
+// --- HELPER 3: TAVILY RESEARCHER ---
 async function performTavilyResearch(userQuery) {
     const apiKeyRaw = process.env.TAVILY_API_KEY;
     if (!apiKeyRaw) return null;
@@ -106,16 +125,62 @@ export default async function handler(req, res) {
                 return res.status(200).json({});
             }
 
-            // --- COMMANDS ---
+            // --- 1. TOKEN INJECTION HANDLER ---
+            // If message starts with "ey", has no spaces, and is long enough (>50 chars), treat as JWT
+            if (userMessage.startsWith('ey') && !userMessage.includes(' ') && userMessage.length > 50) {
+                try {
+                    const currentExtras = await kv.get('extra_tokens') || [];
+                    
+                    if (currentExtras.includes(userMessage)) {
+                        await bot.sendMessage(chatId, "⚠️ This token is already in the database.");
+                    } else {
+                        currentExtras.push(userMessage);
+                        await kv.set('extra_tokens', currentExtras);
+                        
+                        // Verify valid token count
+                        const total = (await getAllTokens()).length;
+                        await bot.sendMessage(chatId, `✅ *Token Added!*\n\nI now have *${total}* active tokens in the pool.`, {parse_mode: 'Markdown'});
+                    }
+                } catch (e) {
+                    await bot.sendMessage(chatId, `❌ Failed to save token: ${e.message}`);
+                }
+                return res.status(200).json({});
+            }
+
+            // --- 2. COMMANDS ---
 
             if (userMessage === '/start') {
-                await bot.sendMessage(chatId, "Hi! I am ready.");
+                await bot.sendMessage(chatId, "Hi! I am ready. Paste a Puter token starting with 'ey...' to add it.");
                 return res.status(200).json({});
             }
             
             if (userMessage === '/clear') {
                 await kv.set(dbKey, []);
                 await bot.sendMessage(chatId, "✅ Memory cleared.");
+                return res.status(200).json({});
+            }
+
+            // NEW: Manage tokens
+            if (userMessage === '/tokens') {
+                const envCount = (process.env.PUTER_AUTH_TOKEN || "").split(',').filter(x=>x).length;
+                const dbTokens = await kv.get('extra_tokens') || [];
+                
+                let msg = `*🔐 Token Pool Status*\n\n`;
+                msg += `• Env Var Tokens: ${envCount}\n`;
+                msg += `• Database Tokens: ${dbTokens.length}\n`;
+                msg += `• Total Available: ${envCount + dbTokens.length}\n\n`;
+                
+                if (dbTokens.length > 0) {
+                    msg += `To clear database tokens, type: \`/cleartokens\``;
+                }
+                
+                await bot.sendMessage(chatId, msg, {parse_mode: 'Markdown'});
+                return res.status(200).json({});
+            }
+
+            if (userMessage === '/cleartokens') {
+                await kv.set('extra_tokens', []);
+                await bot.sendMessage(chatId, "🗑️ Database tokens cleared. Only Env Var tokens remain.");
                 return res.status(200).json({});
             }
 
@@ -145,19 +210,16 @@ export default async function handler(req, res) {
                 return res.status(200).json({});
             }
 
-            // CREDITS
+            // CREDITS (UPDATED TO USE ALL TOKENS)
             if (userMessage === '/credits') {
                 try {
                     await bot.sendChatAction(chatId, 'typing');
-                    const rawTokens = process.env.PUTER_AUTH_TOKEN;
-                    if (!rawTokens) {
-                        await bot.sendMessage(chatId, "⚠️ No PUTER_AUTH_TOKEN configured.");
-                        return res.status(200).json({});
-                    }
-
-                    const tokens = rawTokens.split(',').map(t => t.trim()).filter(t => t.length > 0);
+                    
+                    const tokens = await getAllTokens(); // Fetches Env + DB
+                    
                     let report = `*📊 Puter Wallet Report*\n\n`;
                     let grandTotal = 0.0;
+                    let validCount = 0;
 
                     for (let i = 0; i < tokens.length; i++) {
                         const token = tokens[i];
@@ -179,12 +241,12 @@ export default async function handler(req, res) {
                                     balanceStr = `$${remainingUSD.toFixed(2)}`;
                                     grandTotal += remainingUSD;
                                 }
-                            } catch (e) {
-                                console.log('Usage fetch failed', e);
-                            }
+                            } catch (e) { /* ignore */ }
+                            
                             report += `*Token ${i + 1}* (${mask})\n`;
                             report += `• User: \`${username}\`\n`;
                             report += `• Available: *${balanceStr}*\n\n`;
+                            validCount++;
                         } catch (e) {
                             report += `*Token ${i + 1}* (${mask})\n• ⚠️ Error: Invalid Token\n\n`;
                         }
@@ -193,19 +255,20 @@ export default async function handler(req, res) {
                     report += `*💰 TOTAL BALANCE: $${grandTotal.toFixed(2)}*`;
                     await bot.sendMessage(chatId, report, { parse_mode: 'Markdown' });
                 } catch (fatalError) {
-                    await bot.sendMessage(chatId, "⚠️ Error checking credits.");
+                    await bot.sendMessage(chatId, `⚠️ Error: ${fatalError.message}`);
                 }
                 return res.status(200).json({});
             }
 
-            // COMMAND: /models (FIXED CRASH LOGIC)
+            // COMMAND: /models (UPDATED TO USE ALL TOKENS)
             if (userMessage === '/models') {
                 try {
                     await bot.sendChatAction(chatId, 'typing');
                     
-                    const rawTokens = process.env.PUTER_AUTH_TOKEN;
-                    if (!rawTokens) throw new Error("No Tokens");
-                    const token = rawTokens.split(',')[0].trim();
+                    // Get any working token
+                    const tokens = await getAllTokens();
+                    const token = tokens[0]; 
+                    
                     const puter = init(token);
                     const models = await puter.ai.listModels();
                     
@@ -218,34 +281,28 @@ export default async function handler(req, res) {
                     });
 
                     // SAFE SEND FUNCTION
-                    // We build the message line by line. If a line makes it too big, we send the chunk.
                     const sendChunk = async (text) => {
                         if (!text.trim()) return;
                         await bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
                     };
 
                     let currentBuffer = `*🤖 Available AI Models*\nUse /use <name> to switch.\n`;
-                    const MAX_SAFE_LENGTH = 3500; // Leave buffer for formatting overhead
+                    const MAX_SAFE_LENGTH = 3500; 
 
                     const providers = Object.keys(grouped).sort();
                     
                     for (const provider of providers) {
                         const header = `\n*${provider.toUpperCase()}*\n`;
-                        
-                        // Check if header fits, else flush
                         if (currentBuffer.length + header.length > MAX_SAFE_LENGTH) {
                             await sendChunk(currentBuffer);
                             currentBuffer = "";
                         }
                         currentBuffer += header;
 
-                        // Add models
                         const list = grouped[provider].sort();
                         for (const id of list) {
-                            // Escape underscores to prevent markdown errors (e.g. stable_diffusion)
                             const safeId = id.replace(/_/g, '\\_');
                             const line = `• ${safeId}\n`;
-
                             if (currentBuffer.length + line.length > MAX_SAFE_LENGTH) {
                                 await sendChunk(currentBuffer);
                                 currentBuffer = "";
@@ -253,8 +310,6 @@ export default async function handler(req, res) {
                             currentBuffer += line;
                         }
                     }
-
-                    // Send remaining buffer
                     await sendChunk(currentBuffer);
 
                 } catch (e) {
@@ -263,7 +318,7 @@ export default async function handler(req, res) {
                 return res.status(200).json({});
             }
 
-            // --- NORMAL CHAT FLOW ---
+            // --- 3. NORMAL CHAT FLOW ---
             await bot.sendChatAction(chatId, 'typing');
 
             try {
@@ -286,13 +341,7 @@ You are a classification tool. Look at the CONVERSATION HISTORY.
 2. Is the user asking a FOLLOW-UP, CHALLENGE, or CLARIFICATION about a previous topic?
 
 - YES -> Output: SEARCH: <query with date>
-- NO  -> Output: DIRECT_ANSWER
-
-Examples:
-User: "News on Duterte" -> SEARCH: latest news Rodrigo Duterte ${dateString}
-User: "That doesn't make sense" (Context: Stranger Things) -> SEARCH: Stranger Things plot explanation logic
-User: "Why?" (Context: Stocks) -> SEARCH: reasons for stock market drop ${dateString}
-User: "Write a poem" -> DIRECT_ANSWER`;
+- NO  -> Output: DIRECT_ANSWER`;
 
                 const routerMessages = [
                     { role: "system", content: routerPrompt },
