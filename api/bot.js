@@ -316,25 +316,33 @@ export default async function handler(req, res) {
                     timeZone: 'Asia/Manila' 
                 });
 
-                // --- SIMPLIFIED ROUTER LOGIC ---
+                // --- RE-TWEAKED ROUTER LOGIC ---
                 const routerPrompt = `Current Date: ${dateString}
 
-Classify the user's message.
+TASK: Determine if the user's query requires external search.
+OUTPUT FORMAT: Strictly "SEARCH: <query>" OR "DIRECT_ANSWER" only. Do NOT answer the question.
 
-OUTPUT "SEARCH: <query>" IF:
-- Asking for NEWS, WEATHER, or CURRENT EVENTS (sports, politics).
-- Asking about the current STATUS, LOCATION, or ALIVE/DEAD state of a person.
-- Asking for REAL-TIME data (prices, stocks, dates of upcoming events).
-- Asking about ANY topic where facts might have changed recently.
+RULES:
+1. SEARCH=TRUE if the query involves:
+   - Recent or real-time information (News, Weather, Sports, Stocks).
+   - "Today", "Yesterday", "Current", "Latest".
+   - Status of people/entities (Alive/Dead, Net Worth, CEO).
+   - Prices, Product Availability, Release Dates.
+   - Factual claims requiring verification.
+   - Specific URLs or Website content.
 
-OUTPUT "DIRECT_ANSWER" IF:
-- General knowledge, definitions, history, coding, creative writing, or casual chat.
+2. SEARCH=FALSE (DIRECT_ANSWER) if:
+   - General knowledge (History pre-2023, Science definitions).
+   - Coding, Math, Logic, Reasoning.
+   - Creative writing, Roleplay, Opinions.
+   - Timeless concepts.
 
 Examples:
-"Is Enrile alive?" -> SEARCH: current status Juan Ponce Enrile
-"Weather in Manila" -> SEARCH: weather Manila today
-"Who is Rizal?" -> DIRECT_ANSWER
-"Latest on Duterte" -> SEARCH: latest news Rodrigo Duterte`;
+"Is Enrile dead?" -> SEARCH: current status Juan Ponce Enrile alive or dead
+"News on Duterte" -> SEARCH: latest news Rodrigo Duterte
+"Weather Manila" -> SEARCH: weather forecast Manila today
+"Write a python script" -> DIRECT_ANSWER
+"Who is Jose Rizal?" -> DIRECT_ANSWER`;
 
                 const routerMessages = [
                     { role: "system", content: routerPrompt },
