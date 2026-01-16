@@ -3,16 +3,14 @@ const TelegramBot = require('node-telegram-bot-api');
 const { kv } = require('@vercel/kv');
 const { init } = require('@heyputer/puter.js/src/init.cjs');
 
-// --- HELPER 1: CLAUDE CALL WRAPPER (Updated) ---
+// --- HELPER 1: CLAUDE CALL WRAPPER ---
 async function callClaudeWithRotation(messages) {
-    // 1. Get tokens directly from Env Var instead of Gist
     const rawTokens = process.env.PUTER_AUTH_TOKEN;
     if (!rawTokens) throw new Error("Missing PUTER_AUTH_TOKEN env var.");
 
-    // Split by comma to support multiple backup tokens if desired
     let tokens = rawTokens.split(',').map(t => t.trim()).filter(t => t.length > 0);
     
-    // Shuffle tokens (Load Balancing)
+    // Shuffle
     for (let i = tokens.length - 1; i > 0; i--) {
         const j = Math.floor(Math.random() * (i + 1));
         [tokens[i], tokens[j]] = [tokens[j], tokens[i]];
@@ -125,7 +123,7 @@ export default async function handler(req, res) {
                     weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' 
                 });
 
-                // 2. ROUTER PHASE (Now sees Hidden Context from previous turns!)
+                // 2. ROUTER PHASE
                 const routerPrompt = `Current Date: ${dateString}
 
 You are a classification tool. Look at the CONVERSATION HISTORY.
@@ -150,7 +148,7 @@ User: "Write a poem" -> DIRECT_ANSWER`;
                 const routerResponse = await callClaudeWithRotation(routerMessages);
                 
                 let finalResponse = "";
-                let hiddenSearchData = ""; // We will store search results here to hide them later
+                let hiddenSearchData = ""; 
 
                 // 3. EXECUTION PHASE
                 if (routerResponse.trim().startsWith("SEARCH:")) {
@@ -159,14 +157,14 @@ User: "Write a poem" -> DIRECT_ANSWER`;
                     
                     const searchResults = await performTavilyResearch(searchQuery);
 
-                    // Store results for the DB, so next turn remembers them
                     if (searchResults) {
                         hiddenSearchData = `\n\n:::SEARCH_CONTEXT:::\nQuery: ${searchQuery}\n${searchResults}\n:::END_SEARCH_CONTEXT:::`;
                     }
 
+                    // --- UPDATED: ADDED "NO TABLES" RULE HERE ---
                     const contextMsg = {
                         role: "system",
-                        content: `[SYSTEM DATA]\nDate: ${dateString}\nSearch Query: "${searchQuery}"\nResults:\n${searchResults || "No results found."}\n\nInstruction: Answer the user's question directly using these results.\n\nCRITICAL STYLE RULE: Do NOT say "Based on the search results" or "According to...". Answer confidently and professionally as if you already knew it.`
+                        content: `[SYSTEM DATA]\nDate: ${dateString}\nSearch Query: "${searchQuery}"\nResults:\n${searchResults || "No results found."}\n\nInstruction: Answer the user's question directly using these results.\n\nCRITICAL STYLE RULE: Do NOT say "Based on the search results". Answer confidently. STRICTLY NO MARKDOWN TABLES. Use bullet points or plain text lists instead.`
                     };
 
                     const answerMessages = [
@@ -179,9 +177,12 @@ User: "Write a poem" -> DIRECT_ANSWER`;
                     finalResponse = await callClaudeWithRotation(answerMessages);
                 } 
                 else {
-                    // Direct Answer
+                    // --- UPDATED: ADDED "NO TABLES" RULE HERE ---
+                    const systemPrompt = (process.env.SYSTEM_PROMPT || "You are a helpful assistant.") + 
+                                         "\n\nSTRICT OUTPUT RULE: Do NOT use Markdown tables. Use bullet points or plain text formats only.";
+
                     const answerMessages = [
-                        { role: "system", content: process.env.SYSTEM_PROMPT || "You are a helpful assistant." },
+                        { role: "system", content: systemPrompt },
                         ...history
                     ];
                     finalResponse = await callClaudeWithRotation(answerMessages);
@@ -196,18 +197,14 @@ User: "Write a poem" -> DIRECT_ANSWER`;
                     .replace(/^\s*[-_*]{3,}\s*$/gm, '')    
                     .trim();
 
-                // 5. SAVE TO DB WITH HIDDEN CONTEXT
-                // We append the hidden search data to the message in the database ONLY.
-                // The user never sees it, but the AI sees it in the history next time.
                 const dbContent = cleanReply + hiddenSearchData;
 
                 history.push({ role: 'assistant', content: dbContent });
                 
-                // Keep history manageable (last 20 turns)
                 if (history.length > 20) history = history.slice(-20);
                 await kv.set(dbKey, history);
 
-                // 6. SEND TO USER (WITHOUT HIDDEN CONTEXT)
+                // 6. SEND TO USER
                 const MAX_CHUNK = 4000;
                 for (let i = 0; i < cleanReply.length; i += MAX_CHUNK) {
                     await bot.sendMessage(chatId, cleanReply.substring(i, i + MAX_CHUNK), { parse_mode: 'Markdown' });
