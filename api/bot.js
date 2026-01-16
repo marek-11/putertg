@@ -8,11 +8,9 @@ const DEFAULT_MODEL = 'claude-opus-4-5';
 
 // --- HELPER 1: GET ALL TOKENS (ENV + DB) ---
 async function getAllTokens() {
-    // 1. Static from Env
     const rawStatic = process.env.PUTER_AUTH_TOKEN || "";
     const staticTokens = rawStatic.split(',').map(t => t.trim()).filter(t => t.length > 0);
 
-    // 2. Dynamic from KV (Database)
     let dynamicTokens = [];
     try {
         dynamicTokens = await kv.get('extra_tokens') || [];
@@ -21,7 +19,6 @@ async function getAllTokens() {
         console.warn("KV Token fetch failed:", e);
     }
 
-    // 3. Merge & Deduplicate
     const combined = [...new Set([...staticTokens, ...dynamicTokens])];
     if (combined.length === 0) throw new Error("No PUTER_AUTH_TOKEN found in Env or DB.");
     return combined;
@@ -192,14 +189,12 @@ export default async function handler(req, res) {
                 return res.status(200).json({});
             }
 
-            // --- NEW: /bal COMMAND ---
             if (userMessage === '/bal') {
                 try {
                     await bot.sendChatAction(chatId, 'typing');
                     const tokens = await getAllTokens();
                     let grandTotal = 0.0;
                     
-                    // Quick Loop
                     for (const token of tokens) {
                         try {
                             const puter = init(token);
@@ -207,7 +202,7 @@ export default async function handler(req, res) {
                             if (usageData?.allowanceInfo?.remaining) {
                                 grandTotal += (usageData.allowanceInfo.remaining / 100000000);
                             }
-                        } catch (e) { /* ignore invalid tokens in quick balance check */ }
+                        } catch (e) { /* ignore invalid tokens */ }
                     }
                     
                     const msg = `*💰 Balance Summary*\n\n• Total # of tokens: \`${tokens.length}\`\n• Total Balance: \`$${grandTotal.toFixed(2)}\``;
@@ -218,7 +213,6 @@ export default async function handler(req, res) {
                 return res.status(200).json({});
             }
 
-            // --- DETAILED CREDITS COMMAND ---
             if (userMessage === '/credits') {
                 try {
                     await bot.sendChatAction(chatId, 'typing');
@@ -264,7 +258,6 @@ export default async function handler(req, res) {
                 return res.status(200).json({});
             }
 
-            // --- MODELS COMMAND ---
             if (userMessage === '/models') {
                 try {
                     await bot.sendChatAction(chatId, 'typing');
@@ -324,24 +317,38 @@ export default async function handler(req, res) {
 
                 const now = new Date();
                 const dateString = now.toLocaleDateString("en-US", { 
-                    weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' 
+                    weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
+                    timeZone: 'Asia/Manila' 
                 });
 
+                // --- IMPROVED ROUTER PROMPT ---
+                // We are stricter: if it touches on real-world status, we force a search.
                 const routerPrompt = `Current Date: ${dateString}
 
-You are a classification tool. Look at the CONVERSATION HISTORY.
+You are a strictly objective classification tool. Your ONLY job is to decide if a query requires real-time external verification.
 
-1. Does the latest user message require external information?
-2. Is the user asking a FOLLOW-UP, CHALLENGE, or CLARIFICATION about a previous topic?
+CRITICAL: Your internal knowledge is OUTDATED. You do not know events after 2023/2024.
 
-- YES -> Output: SEARCH: <query with date>
-- NO  -> Output: DIRECT_ANSWER
+TRIGGER SEARCH (Output: SEARCH: <query>) IF:
+1. The user asks about the "current" status, location, health, or life/death of ANY public figure (politician, celebrity, etc.).
+2. The user asks for "news", "latest", "update", "today", "yesterday".
+3. The user asks about prices, stock values, exchange rates, or weather.
+4. The user asks about specific events (sports results, elections, accidents).
+5. The user asks a factual question about a specific entity (company, person, place) where details might have changed.
+
+SKIP SEARCH (Output: DIRECT_ANSWER) ONLY IF:
+1. The request is creative (write a poem, joke, email).
+2. The request is technical/coding (how to use Python, fix this bug).
+3. The request is philosophical or opinion-based (what is love).
+4. The request is general knowledge that is immutable (who is the first president, what is a cell).
+
+If you are 99% sure, but there is a 1% chance the info changed recently -> SEARCH.
 
 Examples:
-User: "News on Duterte" -> SEARCH: latest news Rodrigo Duterte ${dateString}
-User: "That doesn't make sense" (Context: Stranger Things) -> SEARCH: Stranger Things plot explanation logic
-User: "Why?" (Context: Stocks) -> SEARCH: reasons for stock market drop ${dateString}
-User: "Write a poem" -> DIRECT_ANSWER`;
+"Is Enrile dead?" -> SEARCH: current status Juan Ponce Enrile alive or dead
+"News on Duterte" -> SEARCH: latest news Rodrigo Duterte
+"Who is Jose Rizal?" -> DIRECT_ANSWER (Immutable fact)
+"How to code in JS?" -> DIRECT_ANSWER`;
 
                 const routerMessages = [
                     { role: "system", content: routerPrompt },
