@@ -3,28 +3,16 @@ const TelegramBot = require('node-telegram-bot-api');
 const { kv } = require('@vercel/kv');
 const { init } = require('@heyputer/puter.js/src/init.cjs');
 
-// --- HELPER 1: FETCH TOKENS FROM GIST ---
-async function fetchPuterTokens() {
-    if (!process.env.GIST_TOKEN_URL) throw new Error("Missing GIST_TOKEN_URL env var.");
-    try {
-        const res = await fetch(`${process.env.GIST_TOKEN_URL}?t=${Date.now()}`);
-        if (!res.ok) throw new Error(`Gist fetch failed: ${res.status}`);
-        const text = await res.text();
-        if (text.includes("<!DOCTYPE")) throw new Error("Invalid Gist URL. Use 'Raw' URL.");
-        
-        const tokens = text.split(/[\n,]+/).map(t => t.trim()).filter(t => t.length > 10);
-        if (tokens.length === 0) throw new Error("No valid tokens found in Gist.");
-        return tokens;
-    } catch (e) {
-        throw new Error(`Token Load Error: ${e.message}`);
-    }
-}
-
-// --- HELPER 2: CLAUDE CALL WRAPPER ---
+// --- HELPER 1: CLAUDE CALL WRAPPER (Updated) ---
 async function callClaudeWithRotation(messages) {
-    let tokens = await fetchPuterTokens();
+    // 1. Get tokens directly from Env Var instead of Gist
+    const rawTokens = process.env.PUTER_AUTH_TOKEN;
+    if (!rawTokens) throw new Error("Missing PUTER_AUTH_TOKEN env var.");
+
+    // Split by comma to support multiple backup tokens if desired
+    let tokens = rawTokens.split(',').map(t => t.trim()).filter(t => t.length > 0);
     
-    // Shuffle
+    // Shuffle tokens (Load Balancing)
     for (let i = tokens.length - 1; i > 0; i--) {
         const j = Math.floor(Math.random() * (i + 1));
         [tokens[i], tokens[j]] = [tokens[j], tokens[i]];
@@ -72,7 +60,7 @@ async function callClaudeWithRotation(messages) {
     throw new Error(`All tokens failed. Last error: ${lastError?.message}`);
 }
 
-// --- HELPER 3: TAVILY RESEARCHER ---
+// --- HELPER 2: TAVILY RESEARCHER ---
 async function performTavilyResearch(userQuery) {
     const apiKeyRaw = process.env.TAVILY_API_KEY;
     if (!apiKeyRaw) return null;
