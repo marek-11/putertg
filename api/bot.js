@@ -140,7 +140,6 @@ export default async function handler(req, res) {
             }
 
             // --- 2. COMMANDS ---
-
             if (userMessage === '/start') {
                 await bot.sendMessage(chatId, "Hi! I am ready.");
                 return res.status(200).json({});
@@ -194,7 +193,6 @@ export default async function handler(req, res) {
                     await bot.sendChatAction(chatId, 'typing');
                     const tokens = await getAllTokens();
                     let grandTotal = 0.0;
-                    
                     for (const token of tokens) {
                         try {
                             const puter = init(token);
@@ -204,7 +202,6 @@ export default async function handler(req, res) {
                             }
                         } catch (e) { /* ignore invalid tokens */ }
                     }
-                    
                     const msg = `*💰 Balance Summary*\n\n• Total # of tokens: \`${tokens.length}\`\n• Total Balance: \`$${grandTotal.toFixed(2)}\``;
                     await bot.sendMessage(chatId, msg, { parse_mode: 'Markdown' });
                 } catch (e) {
@@ -230,7 +227,6 @@ export default async function handler(req, res) {
                                 const user = await puter.auth.getUser();
                                 username = user.username || "Unknown";
                             } catch (e) {}
-
                             let balanceStr = "N/A";
                             try {
                                 const usageData = await puter.auth.getMonthlyUsage();
@@ -241,7 +237,6 @@ export default async function handler(req, res) {
                                     grandTotal += usd;
                                 }
                             } catch (e) {}
-                            
                             report += `*Token ${i + 1}* (${mask})\n`;
                             report += `• User: \`${username}\`\n`;
                             report += `• Available: *${balanceStr}*\n\n`;
@@ -321,34 +316,25 @@ export default async function handler(req, res) {
                     timeZone: 'Asia/Manila' 
                 });
 
-                // --- IMPROVED ROUTER PROMPT ---
-                // We are stricter: if it touches on real-world status, we force a search.
+                // --- SIMPLIFIED ROUTER LOGIC ---
                 const routerPrompt = `Current Date: ${dateString}
 
-You are a strictly objective classification tool. Your ONLY job is to decide if a query requires real-time external verification.
+Classify the user's message.
 
-CRITICAL: Your internal knowledge is OUTDATED. You do not know events after 2023/2024.
+OUTPUT "SEARCH: <query>" IF:
+- Asking for NEWS, WEATHER, or CURRENT EVENTS (sports, politics).
+- Asking about the current STATUS, LOCATION, or ALIVE/DEAD state of a person.
+- Asking for REAL-TIME data (prices, stocks, dates of upcoming events).
+- Asking about ANY topic where facts might have changed recently.
 
-TRIGGER SEARCH (Output: SEARCH: <query>) IF:
-1. The user asks about the "current" status, location, health, or life/death of ANY public figure (politician, celebrity, etc.).
-2. The user asks for "news", "latest", "update", "today", "yesterday".
-3. The user asks about prices, stock values, exchange rates, or weather.
-4. The user asks about specific events (sports results, elections, accidents).
-5. The user asks a factual question about a specific entity (company, person, place) where details might have changed.
-
-SKIP SEARCH (Output: DIRECT_ANSWER) ONLY IF:
-1. The request is creative (write a poem, joke, email).
-2. The request is technical/coding (how to use Python, fix this bug).
-3. The request is philosophical or opinion-based (what is love).
-4. The request is general knowledge that is immutable (who is the first president, what is a cell).
-
-If you are 99% sure, but there is a 1% chance the info changed recently -> SEARCH.
+OUTPUT "DIRECT_ANSWER" IF:
+- General knowledge, definitions, history, coding, creative writing, or casual chat.
 
 Examples:
-"Is Enrile dead?" -> SEARCH: current status Juan Ponce Enrile alive or dead
-"News on Duterte" -> SEARCH: latest news Rodrigo Duterte
-"Who is Jose Rizal?" -> DIRECT_ANSWER (Immutable fact)
-"How to code in JS?" -> DIRECT_ANSWER`;
+"Is Enrile alive?" -> SEARCH: current status Juan Ponce Enrile
+"Weather in Manila" -> SEARCH: weather Manila today
+"Who is Rizal?" -> DIRECT_ANSWER
+"Latest on Duterte" -> SEARCH: latest news Rodrigo Duterte`;
 
                 const routerMessages = [
                     { role: "system", content: routerPrompt },
