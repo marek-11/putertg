@@ -29,7 +29,6 @@ async function getAllTokens() {
 
 // --- HELPER 2: CLAUDE CALL WRAPPER ---
 async function callClaudeWithRotation(messages, modelId = DEFAULT_MODEL) {
-    // Fetch merged pool of tokens
     let tokens = await getAllTokens();
     
     // Shuffle
@@ -126,20 +125,16 @@ export default async function handler(req, res) {
             }
 
             // --- 1. TOKEN INJECTION HANDLER ---
-            // If message starts with "ey", has no spaces, and is long enough (>50 chars), treat as JWT
             if (userMessage.startsWith('ey') && !userMessage.includes(' ') && userMessage.length > 50) {
                 try {
                     const currentExtras = await kv.get('extra_tokens') || [];
-                    
                     if (currentExtras.includes(userMessage)) {
                         await bot.sendMessage(chatId, "⚠️ This token is already in the database.");
                     } else {
                         currentExtras.push(userMessage);
                         await kv.set('extra_tokens', currentExtras);
-                        
-                        // Verify valid token count
                         const total = (await getAllTokens()).length;
-                        await bot.sendMessage(chatId, `✅ *Token Added!*\n\nI now have *${total}* active tokens in the pool.`, {parse_mode: 'Markdown'});
+                        await bot.sendMessage(chatId, `✅ *Token Added!*\nTotal active tokens: *${total}*`, {parse_mode: 'Markdown'});
                     }
                 } catch (e) {
                     await bot.sendMessage(chatId, `❌ Failed to save token: ${e.message}`);
@@ -150,7 +145,7 @@ export default async function handler(req, res) {
             // --- 2. COMMANDS ---
 
             if (userMessage === '/start') {
-                await bot.sendMessage(chatId, "Hi! I am ready. Paste a Puter token starting with 'ey...' to add it.");
+                await bot.sendMessage(chatId, "Hi! I am ready.");
                 return res.status(200).json({});
             }
             
@@ -160,66 +155,76 @@ export default async function handler(req, res) {
                 return res.status(200).json({});
             }
 
-            // NEW: Manage tokens
             if (userMessage === '/tokens') {
                 const envCount = (process.env.PUTER_AUTH_TOKEN || "").split(',').filter(x=>x).length;
                 const dbTokens = await kv.get('extra_tokens') || [];
-                
-                let msg = `*🔐 Token Pool Status*\n\n`;
-                msg += `• Env Var Tokens: ${envCount}\n`;
-                msg += `• Database Tokens: ${dbTokens.length}\n`;
-                msg += `• Total Available: ${envCount + dbTokens.length}\n\n`;
-                
-                if (dbTokens.length > 0) {
-                    msg += `To clear database tokens, type: \`/cleartokens\``;
-                }
-                
+                let msg = `*🔐 Token Pool Status*\n\n• Env Var: ${envCount}\n• Database: ${dbTokens.length}\n• Total: ${envCount + dbTokens.length}\n\nType \`/cleartokens\` to wipe DB tokens.`;
                 await bot.sendMessage(chatId, msg, {parse_mode: 'Markdown'});
                 return res.status(200).json({});
             }
 
             if (userMessage === '/cleartokens') {
                 await kv.set('extra_tokens', []);
-                await bot.sendMessage(chatId, "🗑️ Database tokens cleared. Only Env Var tokens remain.");
+                await bot.sendMessage(chatId, "🗑️ Database tokens cleared.");
                 return res.status(200).json({});
             }
 
-            // SWITCH MODEL
             if (userMessage.startsWith('/use')) {
                 const newModel = userMessage.replace('/use', '').trim();
                 if (!newModel) {
-                    await bot.sendMessage(chatId, "⚠️ Please specify a model name. Example: `/use gpt-4o`", {parse_mode: 'Markdown'});
+                    await bot.sendMessage(chatId, "⚠️ Specify model. Ex: `/use gpt-4o`", {parse_mode: 'Markdown'});
                     return res.status(200).json({});
                 }
                 await kv.set(modelKey, newModel);
-                await bot.sendMessage(chatId, `✅ Switched model to: \`${newModel}\``, {parse_mode: 'Markdown'});
+                await bot.sendMessage(chatId, `✅ Switched to: \`${newModel}\``, {parse_mode: 'Markdown'});
                 return res.status(200).json({});
             }
 
-            // RESET MODEL
             if (userMessage === '/reset') {
                 await kv.del(modelKey);
-                await bot.sendMessage(chatId, `🔄 Reverted to default: \`${DEFAULT_MODEL}\``, {parse_mode: 'Markdown'});
+                await bot.sendMessage(chatId, `🔄 Reverted to: \`${DEFAULT_MODEL}\``, {parse_mode: 'Markdown'});
                 return res.status(200).json({});
             }
 
-            // CURRENT MODEL
             if (userMessage === '/current') {
                 const current = await kv.get(modelKey) || DEFAULT_MODEL;
-                await bot.sendMessage(chatId, `🧠 Current Model: \`${current}\``, {parse_mode: 'Markdown'});
+                await bot.sendMessage(chatId, `🧠 Current: \`${current}\``, {parse_mode: 'Markdown'});
                 return res.status(200).json({});
             }
 
-            // CREDITS (UPDATED TO USE ALL TOKENS)
+            // --- NEW: /bal COMMAND ---
+            if (userMessage === '/bal') {
+                try {
+                    await bot.sendChatAction(chatId, 'typing');
+                    const tokens = await getAllTokens();
+                    let grandTotal = 0.0;
+                    
+                    // Quick Loop
+                    for (const token of tokens) {
+                        try {
+                            const puter = init(token);
+                            const usageData = await puter.auth.getMonthlyUsage();
+                            if (usageData?.allowanceInfo?.remaining) {
+                                grandTotal += (usageData.allowanceInfo.remaining / 100000000);
+                            }
+                        } catch (e) { /* ignore invalid tokens in quick balance check */ }
+                    }
+                    
+                    const msg = `*💰 Balance Summary*\n\n• Total # of tokens: \`${tokens.length}\`\n• Total Balance: \`$${grandTotal.toFixed(2)}\``;
+                    await bot.sendMessage(chatId, msg, { parse_mode: 'Markdown' });
+                } catch (e) {
+                    await bot.sendMessage(chatId, "⚠️ Error fetching balance.");
+                }
+                return res.status(200).json({});
+            }
+
+            // --- DETAILED CREDITS COMMAND ---
             if (userMessage === '/credits') {
                 try {
                     await bot.sendChatAction(chatId, 'typing');
-                    
-                    const tokens = await getAllTokens(); // Fetches Env + DB
-                    
-                    let report = `*📊 Puter Wallet Report*\n\n`;
+                    const tokens = await getAllTokens();
+                    let report = `*📊 Detailed Report*\n\n`;
                     let grandTotal = 0.0;
-                    let validCount = 0;
 
                     for (let i = 0; i < tokens.length; i++) {
                         const token = tokens[i];
@@ -236,43 +241,37 @@ export default async function handler(req, res) {
                             try {
                                 const usageData = await puter.auth.getMonthlyUsage();
                                 if (usageData && usageData.allowanceInfo) {
-                                    const remainingMicro = usageData.allowanceInfo.remaining || 0;
-                                    const remainingUSD = remainingMicro / 100000000;
-                                    balanceStr = `$${remainingUSD.toFixed(2)}`;
-                                    grandTotal += remainingUSD;
+                                    const remaining = usageData.allowanceInfo.remaining || 0;
+                                    const usd = remaining / 100000000;
+                                    balanceStr = `$${usd.toFixed(2)}`;
+                                    grandTotal += usd;
                                 }
-                            } catch (e) { /* ignore */ }
+                            } catch (e) {}
                             
                             report += `*Token ${i + 1}* (${mask})\n`;
                             report += `• User: \`${username}\`\n`;
                             report += `• Available: *${balanceStr}*\n\n`;
-                            validCount++;
                         } catch (e) {
-                            report += `*Token ${i + 1}* (${mask})\n• ⚠️ Error: Invalid Token\n\n`;
+                            report += `*Token ${i + 1}* (${mask})\n• ⚠️ Error: Invalid\n\n`;
                         }
                     }
                     report += `-----------------------------\n`;
-                    report += `*💰 TOTAL BALANCE: $${grandTotal.toFixed(2)}*`;
+                    report += `*💰 TOTAL: $${grandTotal.toFixed(2)}*`;
                     await bot.sendMessage(chatId, report, { parse_mode: 'Markdown' });
-                } catch (fatalError) {
-                    await bot.sendMessage(chatId, `⚠️ Error: ${fatalError.message}`);
+                } catch (e) {
+                    await bot.sendMessage(chatId, `⚠️ Error: ${e.message}`);
                 }
                 return res.status(200).json({});
             }
 
-            // COMMAND: /models (UPDATED TO USE ALL TOKENS)
+            // --- MODELS COMMAND ---
             if (userMessage === '/models') {
                 try {
                     await bot.sendChatAction(chatId, 'typing');
-                    
-                    // Get any working token
                     const tokens = await getAllTokens();
-                    const token = tokens[0]; 
-                    
-                    const puter = init(token);
+                    const puter = init(tokens[0]);
                     const models = await puter.ai.listModels();
                     
-                    // Group by Provider
                     const grouped = {};
                     models.forEach(m => {
                         const provider = m.provider || 'Other';
@@ -280,7 +279,6 @@ export default async function handler(req, res) {
                         grouped[provider].push(m.id);
                     });
 
-                    // SAFE SEND FUNCTION
                     const sendChunk = async (text) => {
                         if (!text.trim()) return;
                         await bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
@@ -289,9 +287,7 @@ export default async function handler(req, res) {
                     let currentBuffer = `*🤖 Available AI Models*\nUse /use <name> to switch.\n`;
                     const MAX_SAFE_LENGTH = 3500; 
 
-                    const providers = Object.keys(grouped).sort();
-                    
-                    for (const provider of providers) {
+                    for (const provider of Object.keys(grouped).sort()) {
                         const header = `\n*${provider.toUpperCase()}*\n`;
                         if (currentBuffer.length + header.length > MAX_SAFE_LENGTH) {
                             await sendChunk(currentBuffer);
@@ -299,8 +295,7 @@ export default async function handler(req, res) {
                         }
                         currentBuffer += header;
 
-                        const list = grouped[provider].sort();
-                        for (const id of list) {
+                        for (const id of grouped[provider].sort()) {
                             const safeId = id.replace(/_/g, '\\_');
                             const line = `• ${safeId}\n`;
                             if (currentBuffer.length + line.length > MAX_SAFE_LENGTH) {
@@ -311,7 +306,6 @@ export default async function handler(req, res) {
                         }
                     }
                     await sendChunk(currentBuffer);
-
                 } catch (e) {
                     await bot.sendMessage(chatId, `⚠️ Could not fetch models: ${e.message}`);
                 }
@@ -341,7 +335,13 @@ You are a classification tool. Look at the CONVERSATION HISTORY.
 2. Is the user asking a FOLLOW-UP, CHALLENGE, or CLARIFICATION about a previous topic?
 
 - YES -> Output: SEARCH: <query with date>
-- NO  -> Output: DIRECT_ANSWER`;
+- NO  -> Output: DIRECT_ANSWER
+
+Examples:
+User: "News on Duterte" -> SEARCH: latest news Rodrigo Duterte ${dateString}
+User: "That doesn't make sense" (Context: Stranger Things) -> SEARCH: Stranger Things plot explanation logic
+User: "Why?" (Context: Stocks) -> SEARCH: reasons for stock market drop ${dateString}
+User: "Write a poem" -> DIRECT_ANSWER`;
 
                 const routerMessages = [
                     { role: "system", content: routerPrompt },
