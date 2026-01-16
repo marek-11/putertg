@@ -111,9 +111,8 @@ export default async function handler(req, res) {
                 return res.status(200).json({});
             }
 
-            // --- COMMAND: /credits (STABILIZED) ---
+            // --- COMMAND: /credits (DOCS IMPLEMENTATION) ---
             if (userMessage === '/credits') {
-                // Wrap entirely in try/catch to prevent silent bot death
                 try {
                     await bot.sendChatAction(chatId, 'typing');
                     
@@ -124,7 +123,7 @@ export default async function handler(req, res) {
                     }
 
                     const tokens = rawTokens.split(',').map(t => t.trim()).filter(t => t.length > 0);
-                    let report = `*📊 Puter Account Report*\n\n`;
+                    let report = `*📊 Puter Wallet Report*\n\n`;
 
                     for (let i = 0; i < tokens.length; i++) {
                         const token = tokens[i];
@@ -133,40 +132,46 @@ export default async function handler(req, res) {
                         try {
                             const puter = init(token);
                             
-                            // 1. Fetch User Profile
-                            // We use Promise.allSettled to ensure one failing call doesn't stop the other
-                            const [userRes, usageRes] = await Promise.allSettled([
-                                puter.auth.getUser(),
-                                puter.auth.getMonthlyUsage ? puter.auth.getMonthlyUsage() : Promise.resolve(null)
-                            ]);
-
-                            // Process User Data (Balance)
+                            // 1. Get Username
                             let username = "Unknown";
-                            let balanceStr = "N/A";
-                            
-                            if (userRes.status === 'fulfilled') {
-                                const u = userRes.value;
-                                username = u.username || "Unknown";
-                                // Check all known balance fields
-                                const bal = u.balance !== undefined ? u.balance : (u.account_balance || 0);
-                                balanceStr = `$${parseFloat(bal).toFixed(2)}`;
-                            }
+                            try {
+                                const user = await puter.auth.getUser();
+                                username = user.username || "Unknown";
+                            } catch (e) {}
 
-                            // Process Usage Data (Spent this month)
-                            let usageStr = "$0.00";
-                            if (usageRes.status === 'fulfilled' && usageRes.value) {
-                                const usage = usageRes.value;
-                                const cost = usage.total_cost || usage.cost || usage.amount || 0;
-                                usageStr = `$${parseFloat(cost).toFixed(2)}`;
+                            // 2. Get Balance via MonthlyUsage (Microcents)
+                            // Ref: puter.auth.getMonthlyUsage() returns object with allowanceInfo
+                            let balanceStr = "N/A";
+                            let usedStr = "N/A";
+
+                            try {
+                                const usageData = await puter.auth.getMonthlyUsage(); //
+                                
+                                if (usageData && usageData.allowanceInfo) {
+                                    // Calculate Remaining Balance
+                                    // Formula: microcents / 100,000,000 = USD
+                                    const remainingMicro = usageData.allowanceInfo.remaining || 0;
+                                    const remainingUSD = remainingMicro / 100000000;
+                                    balanceStr = `$${remainingUSD.toFixed(2)}`;
+
+                                    // Calculate Amount Used (Optional context)
+                                    // Total Allowance - Remaining = Used
+                                    const totalMicro = usageData.allowanceInfo.monthUsageAllowance || 0;
+                                    const usedMicro = totalMicro - remainingMicro;
+                                    const usedUSD = usedMicro / 100000000;
+                                    usedStr = `$${usedUSD.toFixed(2)}`;
+                                }
+                            } catch (e) {
+                                console.log('Usage fetch failed', e);
                             }
 
                             report += `*Token ${i + 1}* (${mask})\n`;
                             report += `• User: \`${username}\`\n`;
-                            report += `• Balance: ${balanceStr}\n`;
-                            report += `• Usage (Month): ${usageStr}\n\n`;
+                            report += `• Available Balance: *${balanceStr}*\n`;
+                            report += `• Used this Month: ${usedStr}\n\n`;
 
                         } catch (e) {
-                            report += `*Token ${i + 1}* (${mask})\n• ⚠️ Error: Check Token\n\n`;
+                            report += `*Token ${i + 1}* (${mask})\n• ⚠️ Error: Invalid Token\n\n`;
                         }
                     }
                     
@@ -174,7 +179,9 @@ export default async function handler(req, res) {
 
                 } catch (fatalError) {
                     console.error("Credits command crashed:", fatalError);
-                    await bot.sendMessage(chatId, "⚠️ Error checking credits.");
+                    try {
+                         await bot.sendMessage(chatId, "⚠️ Error checking credits.");
+                    } catch(e) {}
                 }
                 
                 return res.status(200).json({});
