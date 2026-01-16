@@ -1,363 +1,172 @@
-// api/bot.js
-const TelegramBot = require('node-telegram-bot-api');
-const { kv } = require('@vercel/kv');
-const { init } = require('@heyputer/puter.js/src/init.cjs');
+import Anthropic from "@anthropic-ai/sdk";
+import { createClient } from "@vercel/kv";
+import TelegramBot from "node-telegram-bot-api";
 
-// --- CONFIGURATION ---
-const DEFAULT_MODEL = 'claude-opus-4-5'; 
+const kv = createClient({
+    url: process.env.KV_REST_API_URL,
+    token: process.env.KV_REST_API_TOKEN,
+});
 
-// --- HELPER 1: GET ALL TOKENS (ENV + DB) ---
-async function getAllTokens() {
-    // 1. Static from Env
-    const rawStatic = process.env.PUTER_AUTH_TOKEN || "";
-    const staticTokens = rawStatic.split(',').map(t => t.trim()).filter(t => t.length > 0);
+const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN);
 
-    // 2. Dynamic from KV (Database)
-    let dynamicTokens = [];
-    try {
-        dynamicTokens = await kv.get('extra_tokens') || [];
-        if (!Array.isArray(dynamicTokens)) dynamicTokens = [];
-    } catch (e) {
-        console.warn("KV Token fetch failed:", e);
-    }
+const ANTHROPIC_API_KEYS = [
+    process.env.ANTHROPIC_API_KEY_1,
+    process.env.ANTHROPIC_API_KEY_2,
+    process.env.ANTHROPIC_API_KEY_3,
+    process.env.ANTHROPIC_API_KEY_4,
+    process.env.ANTHROPIC_API_KEY_5,
+].filter(Boolean);
 
-    // 3. Merge & Deduplicate
-    const combined = [...new Set([...staticTokens, ...dynamicTokens])];
-    if (combined.length === 0) throw new Error("No PUTER_AUTH_TOKEN found in Env or DB.");
-    return combined;
-}
+async function callClaudeWithRotation(messages, model) {
+    let lastError;
 
-// --- HELPER 2: CLAUDE CALL WRAPPER ---
-async function callClaudeWithRotation(messages, modelId = DEFAULT_MODEL) {
-    let tokens = await getAllTokens();
-    
-    // Shuffle
-    for (let i = tokens.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [tokens[i], tokens[j]] = [tokens[j], tokens[i]];
-    }
+    for (let i = 0; i < ANTHROPIC_API_KEYS.length; i++) {
+        const apiKey = ANTHROPIC_API_KEYS[i];
+        const client = new Anthropic({ apiKey });
 
-    let lastError = null;
-
-    for (const token of tokens) {
         try {
-            const puter = init(token);
-            const result = await puter.ai.chat(messages, { model: modelId });
+            const systemMessage = messages.find((m) => m.role === "system");
+            const userMessages = messages.filter((m) => m.role !== "system");
 
-            if (!result) throw new Error("Empty response");
-            if (result.error) throw new Error(JSON.stringify(result));
+            const response = await client.messages.create({
+                model: model,
+                max_tokens: 8096,
+                system: systemMessage?.content || "You are a helpful assistant.",
+                messages: userMessages,
+            });
 
-            let text = "";
-            if (typeof result === 'string') {
-                text = result;
-            } else if (result?.message?.content) {
-                const content = result.message.content;
-                if (typeof content === 'string') text = content;
-                else if (Array.isArray(content)) {
-                    text = content.filter(b => b.type === 'text' || b.text).map(b => b.text || '').join('');
-                }
-            } else if (Array.isArray(result)) {
-                 text = result.map(b => b.text || '').join('');
-            } else {
-                text = JSON.stringify(result);
+            return response.content[0].text;
+        } catch (error) {
+            lastError = error;
+            console.error(`API key ${i + 1} failed:`, error.message);
+
+            if (error.status === 429 || error.status === 529) {
+                continue;
             }
-            text = text.trim();
-
-            if (text.length < 150) {
-                const lower = text.toLowerCase();
-                const failPhrases = ["usage limit", "quota", "insufficient credit", "out of credits", "rate limit"];
-                if (failPhrases.some(p => lower.includes(p))) {
-                    throw new Error(`Quota exceeded: ${text}`);
-                }
-            }
-            return text;
-        } catch (err) {
-            console.warn(`Token ...${token.slice(-4)} failed on ${modelId}: ${err.message}`);
-            lastError = err;
+            throw error;
         }
     }
-    throw new Error(`All tokens failed. Last error: ${lastError?.message}`);
+
+    throw lastError || new Error("All API keys exhausted");
 }
 
-// --- HELPER 3: TAVILY RESEARCHER ---
-async function performTavilyResearch(userQuery) {
-    const apiKeyRaw = process.env.TAVILY_API_KEY;
-    if (!apiKeyRaw) return null;
+async function performWebSearch(query) {
+    const apiKey = process.env.GOOGLE_API_KEY;
+    const searchEngineId = process.env.GOOGLE_SEARCH_ENGINE_ID;
 
-    const keys = apiKeyRaw.split(',').map(k => k.trim()).filter(Boolean);
-    const apiKey = keys[Math.floor(Math.random() * keys.length)];
+    if (!apiKey || !searchEngineId) {
+        console.log("Google Search not configured");
+        return null;
+    }
 
     try {
-        const response = await fetch("https://api.tavily.com/search", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ api_key: apiKey, query: userQuery, search_depth: "basic", include_answer: true, max_results: 5 })
-        });
-        
-        if (!response.ok) return null; 
+        const url = `https://www.googleapis.com/customsearch/v1?key=${apiKey}&cx=${searchEngineId}&q=${encodeURIComponent(query)}&num=5`;
+        const response = await fetch(url);
         const data = await response.json();
-        
-        let context = `Tavily AI Summary: ${data.answer}\n\nDetails:\n`;
-        if (data.results) {
-            data.results.forEach((r, i) => context += `[${i+1}] ${r.title}: ${r.content}\n`);
+
+        if (data.items && data.items.length > 0) {
+            return data.items
+                .map((item, index) => `${index + 1}. ${item.title}\n   ${item.snippet}\n   URL: ${item.link}`)
+                .join("\n\n");
         }
-        return context;
-    } catch (e) {
+        return null;
+    } catch (error) {
+        console.error("Search error:", error);
         return null;
     }
 }
 
-// --- MAIN HANDLER ---
 export default async function handler(req, res) {
-    const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN);
+    if (req.method === "POST") {
+        const { message } = req.body;
 
-    if (req.method === 'POST') {
-        const { body } = req;
-        if (body.message && body.message.text) {
-            const chatId = body.message.chat.id;
-            const userMessage = body.message.text.trim();
-            const dbKey = `chat_history:${chatId}`;
-            const modelKey = `model_pref:${chatId}`;
+        if (message?.text) {
+            const chatId = message.chat.id;
+            const userMessage = message.text;
+            const dbKey = `chat:${chatId}`;
 
-            const allowed = (process.env.WHITELIST || "").split(',').map(i => i.trim());
-            if (allowed.length > 0 && !allowed.includes(chatId.toString())) {
-                return res.status(200).json({});
-            }
-
-            // --- 1. TOKEN INJECTION HANDLER ---
-            if (userMessage.startsWith('ey') && !userMessage.includes(' ') && userMessage.length > 50) {
-                try {
-                    const currentExtras = await kv.get('extra_tokens') || [];
-                    if (currentExtras.includes(userMessage)) {
-                        await bot.sendMessage(chatId, "⚠️ This token is already in the database.");
-                    } else {
-                        currentExtras.push(userMessage);
-                        await kv.set('extra_tokens', currentExtras);
-                        const total = (await getAllTokens()).length;
-                        await bot.sendMessage(chatId, `✅ *Token Added!*\nTotal active tokens: *${total}*`, {parse_mode: 'Markdown'});
-                    }
-                } catch (e) {
-                    await bot.sendMessage(chatId, `❌ Failed to save token: ${e.message}`);
-                }
-                return res.status(200).json({});
-            }
-
-            // --- 2. COMMANDS ---
-
-            if (userMessage === '/start') {
-                await bot.sendMessage(chatId, "Hi! I am ready.");
-                return res.status(200).json({});
-            }
-            
-            if (userMessage === '/clear') {
-                await kv.set(dbKey, []);
-                await bot.sendMessage(chatId, "✅ Memory cleared.");
-                return res.status(200).json({});
-            }
-
-            if (userMessage === '/tokens') {
-                const envCount = (process.env.PUTER_AUTH_TOKEN || "").split(',').filter(x=>x).length;
-                const dbTokens = await kv.get('extra_tokens') || [];
-                let msg = `*🔐 Token Pool Status*\n\n• Env Var: ${envCount}\n• Database: ${dbTokens.length}\n• Total: ${envCount + dbTokens.length}\n\nType \`/cleartokens\` to wipe DB tokens.`;
-                await bot.sendMessage(chatId, msg, {parse_mode: 'Markdown'});
-                return res.status(200).json({});
-            }
-
-            if (userMessage === '/cleartokens') {
-                await kv.set('extra_tokens', []);
-                await bot.sendMessage(chatId, "🗑️ Database tokens cleared.");
-                return res.status(200).json({});
-            }
-
-            if (userMessage.startsWith('/use')) {
-                const newModel = userMessage.replace('/use', '').trim();
-                if (!newModel) {
-                    await bot.sendMessage(chatId, "⚠️ Specify model. Ex: `/use gpt-4o`", {parse_mode: 'Markdown'});
-                    return res.status(200).json({});
-                }
-                await kv.set(modelKey, newModel);
-                await bot.sendMessage(chatId, `✅ Switched to: \`${newModel}\``, {parse_mode: 'Markdown'});
-                return res.status(200).json({});
-            }
-
-            if (userMessage === '/reset') {
-                await kv.del(modelKey);
-                await bot.sendMessage(chatId, `🔄 Reverted to: \`${DEFAULT_MODEL}\``, {parse_mode: 'Markdown'});
-                return res.status(200).json({});
-            }
-
-            if (userMessage === '/current') {
-                const current = await kv.get(modelKey) || DEFAULT_MODEL;
-                await bot.sendMessage(chatId, `🧠 Current: \`${current}\``, {parse_mode: 'Markdown'});
-                return res.status(200).json({});
-            }
-
-            // --- NEW: /bal COMMAND ---
-            if (userMessage === '/bal') {
-                try {
-                    await bot.sendChatAction(chatId, 'typing');
-                    const tokens = await getAllTokens();
-                    let grandTotal = 0.0;
-                    
-                    // Quick Loop
-                    for (const token of tokens) {
-                        try {
-                            const puter = init(token);
-                            const usageData = await puter.auth.getMonthlyUsage();
-                            if (usageData?.allowanceInfo?.remaining) {
-                                grandTotal += (usageData.allowanceInfo.remaining / 100000000);
-                            }
-                        } catch (e) { /* ignore invalid tokens in quick balance check */ }
-                    }
-                    
-                    const msg = `*💰 Balance Summary*\n\n• Total # of tokens: \`${tokens.length}\`\n• Total Balance: \`$${grandTotal.toFixed(2)}\``;
-                    await bot.sendMessage(chatId, msg, { parse_mode: 'Markdown' });
-                } catch (e) {
-                    await bot.sendMessage(chatId, "⚠️ Error fetching balance.");
-                }
-                return res.status(200).json({});
-            }
-
-            // --- DETAILED CREDITS COMMAND ---
-            if (userMessage === '/credits') {
-                try {
-                    await bot.sendChatAction(chatId, 'typing');
-                    const tokens = await getAllTokens();
-                    let report = `*📊 Detailed Report*\n\n`;
-                    let grandTotal = 0.0;
-
-                    for (let i = 0; i < tokens.length; i++) {
-                        const token = tokens[i];
-                        const mask = `${token.slice(0, 4)}...${token.slice(-4)}`;
-                        try {
-                            const puter = init(token);
-                            let username = "Unknown";
-                            try {
-                                const user = await puter.auth.getUser();
-                                username = user.username || "Unknown";
-                            } catch (e) {}
-
-                            let balanceStr = "N/A";
-                            try {
-                                const usageData = await puter.auth.getMonthlyUsage();
-                                if (usageData && usageData.allowanceInfo) {
-                                    const remaining = usageData.allowanceInfo.remaining || 0;
-                                    const usd = remaining / 100000000;
-                                    balanceStr = `$${usd.toFixed(2)}`;
-                                    grandTotal += usd;
-                                }
-                            } catch (e) {}
-                            
-                            report += `*Token ${i + 1}* (${mask})\n`;
-                            report += `• User: \`${username}\`\n`;
-                            report += `• Available: *${balanceStr}*\n\n`;
-                        } catch (e) {
-                            report += `*Token ${i + 1}* (${mask})\n• ⚠️ Error: Invalid\n\n`;
-                        }
-                    }
-                    report += `-----------------------------\n`;
-                    report += `*💰 TOTAL: $${grandTotal.toFixed(2)}*`;
-                    await bot.sendMessage(chatId, report, { parse_mode: 'Markdown' });
-                } catch (e) {
-                    await bot.sendMessage(chatId, `⚠️ Error: ${e.message}`);
-                }
-                return res.status(200).json({});
-            }
-
-            // --- MODELS COMMAND ---
-            if (userMessage === '/models') {
-                try {
-                    await bot.sendChatAction(chatId, 'typing');
-                    const tokens = await getAllTokens();
-                    const puter = init(tokens[0]);
-                    const models = await puter.ai.listModels();
-                    
-                    const grouped = {};
-                    models.forEach(m => {
-                        const provider = m.provider || 'Other';
-                        if (!grouped[provider]) grouped[provider] = [];
-                        grouped[provider].push(m.id);
-                    });
-
-                    const sendChunk = async (text) => {
-                        if (!text.trim()) return;
-                        await bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
-                    };
-
-                    let currentBuffer = `*🤖 Available AI Models*\nUse /use <name> to switch.\n`;
-                    const MAX_SAFE_LENGTH = 3500; 
-
-                    for (const provider of Object.keys(grouped).sort()) {
-                        const header = `\n*${provider.toUpperCase()}*\n`;
-                        if (currentBuffer.length + header.length > MAX_SAFE_LENGTH) {
-                            await sendChunk(currentBuffer);
-                            currentBuffer = "";
-                        }
-                        currentBuffer += header;
-
-                        for (const id of grouped[provider].sort()) {
-                            const safeId = id.replace(/_/g, '\\_');
-                            const line = `• ${safeId}\n`;
-                            if (currentBuffer.length + line.length > MAX_SAFE_LENGTH) {
-                                await sendChunk(currentBuffer);
-                                currentBuffer = "";
-                            }
-                            currentBuffer += line;
-                        }
-                    }
-                    await sendChunk(currentBuffer);
-                } catch (e) {
-                    await bot.sendMessage(chatId, `⚠️ Could not fetch models: ${e.message}`);
-                }
-                return res.status(200).json({});
-            }
-
-            // --- 3. NORMAL CHAT FLOW ---
-            await bot.sendChatAction(chatId, 'typing');
+            let finalResponse = "";
+            let hiddenSearchData = "";
 
             try {
-                let history = await kv.get(dbKey) || [];
-                history.push({ role: 'user', content: userMessage });
+                // Send typing indicator
+                await bot.sendChatAction(chatId, "typing");
 
-                const userModelPref = await kv.get(modelKey);
-                const activeModel = userModelPref || DEFAULT_MODEL;
+                // Get conversation history
+                let history = (await kv.get(dbKey)) || [];
 
-                const now = new Date();
-                const dateString = now.toLocaleDateString("en-US", { 
-                    weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' 
-                });
+                // Handle /clear command
+                if (userMessage.toLowerCase() === "/clear") {
+                    await kv.del(dbKey);
+                    await bot.sendMessage(chatId, "🗑️ Conversation history cleared.");
+                    return res.status(200).json({ status: "ok" });
+                }
 
-                const routerPrompt = `Current Date: ${dateString}
+                // Handle /help command
+                if (userMessage.toLowerCase() === "/help") {
+                    const helpText = `🤖 *Bot Commands*
 
-You are a classification tool. Look at the CONVERSATION HISTORY.
+• /clear - Clear conversation history
+• /help - Show this help message
 
-1. Does the latest user message require external information?
-2. Is the user asking a FOLLOW-UP, CHALLENGE, or CLARIFICATION about a previous topic?
+*Features:*
+• Web search: Ask anything that needs current information
+• Conversation memory: I remember our chat history
+• Smart responses: Powered by Claude AI
 
-- YES -> Output: SEARCH: <query with date>
-- NO  -> Output: DIRECT_ANSWER
+Just send me any message to start chatting!`;
+                    await bot.sendMessage(chatId, helpText, { parse_mode: "Markdown" });
+                    return res.status(200).json({ status: "ok" });
+                }
 
-Examples:
-User: "News on Duterte" -> SEARCH: latest news Rodrigo Duterte ${dateString}
-User: "That doesn't make sense" (Context: Stranger Things) -> SEARCH: Stranger Things plot explanation logic
-User: "Why?" (Context: Stocks) -> SEARCH: reasons for stock market drop ${dateString}
-User: "Write a poem" -> DIRECT_ANSWER`;
+                // Add user message to history
+                history.push({ role: "user", content: userMessage });
 
-                const routerMessages = [
-                    { role: "system", content: routerPrompt },
-                    ...history.slice(-3) 
+                // Determine active model
+                const activeModel = process.env.MODEL_ID || "claude-sonnet-4-20250514";
+
+                // Check if search is needed
+                const searchCheckMessages = [
+                    {
+                        role: "system",
+                        content: `You are a search intent detector. Analyze if the user's message requires a web search for current/real-time information.
+
+Respond with ONLY valid JSON (no markdown, no code blocks):
+{"needsSearch": true, "searchQuery": "optimized search query"} 
+OR
+{"needsSearch": false, "searchQuery": ""}
+
+Needs search: current events, news, weather, prices, real-time data, recent information, facts you're unsure about.
+No search needed: general knowledge, opinions, creative tasks, coding help, math, personal advice.`,
+                    },
+                    { role: "user", content: userMessage },
                 ];
 
-                const routerResponse = await callClaudeWithRotation(routerMessages, DEFAULT_MODEL);
-                
-                let finalResponse = "";
-                let hiddenSearchData = ""; 
+                const searchCheckResponse = await callClaudeWithRotation(searchCheckMessages, activeModel);
 
-                if (routerResponse.trim().startsWith("SEARCH:")) {
-                    const searchQuery = routerResponse.replace("SEARCH:", "").trim();
-                    await bot.sendChatAction(chatId, 'typing'); 
-                    
-                    const searchResults = await performTavilyResearch(searchQuery);
+                let needsSearch = false;
+                let searchQuery = "";
+
+                try {
+                    const cleanedResponse = searchCheckResponse.replace(/```json\n?|\n?```/g, "").trim();
+                    const searchCheck = JSON.parse(cleanedResponse);
+                    needsSearch = searchCheck.needsSearch;
+                    searchQuery = searchCheck.searchQuery;
+                } catch (e) {
+                    console.log("Search check parse error:", e.message);
+                }
+
+                // Perform search if needed
+                if (needsSearch && searchQuery) {
+                    await bot.sendChatAction(chatId, "typing");
+
+                    const searchResults = await performWebSearch(searchQuery);
+                    const dateString = new Date().toLocaleDateString("en-US", {
+                        weekday: "long",
+                        year: "numeric",
+                        month: "long",
+                        day: "numeric",
+                    });
 
                     if (searchResults) {
                         hiddenSearchData = `\n\n:::SEARCH_CONTEXT:::\nQuery: ${searchQuery}\n${searchResults}\n:::END_SEARCH_CONTEXT:::`;
@@ -365,57 +174,67 @@ User: "Write a poem" -> DIRECT_ANSWER`;
 
                     const contextMsg = {
                         role: "system",
-                        content: `[SYSTEM DATA]\nDate: ${dateString}\nSearch Query: "${searchQuery}"\nResults:\n${searchResults || "No results found."}\n\nInstruction: Answer the user's question directly using these results.\n\nCRITICAL STYLE RULE: Do NOT say "Based on the search results". Answer confidently. STRICTLY NO MARKDOWN TABLES. Use bullet points or plain text lists instead.`
+                        content: `[SYSTEM DATA]\nDate: ${dateString}\nSearch Query: "${searchQuery}"\nResults:\n${searchResults || "No results found."}\n\nInstruction: Answer the user's question directly using these results.\n\nCRITICAL STYLE RULE: Do NOT say "Based on the search results". Answer confidently. STRICTLY NO MARKDOWN TABLES. Use bullet points or plain text lists instead.`,
                     };
 
                     const answerMessages = [
                         { role: "system", content: process.env.SYSTEM_PROMPT || "You are a helpful assistant." },
-                        ...history.slice(0, -1), 
-                        contextMsg,              
-                        { role: "user", content: userMessage }
+                        ...history.slice(0, -1),
+                        contextMsg,
+                        { role: "user", content: userMessage },
                     ];
 
                     finalResponse = await callClaudeWithRotation(answerMessages, activeModel);
-                } 
-                else {
-                    const systemPrompt = (process.env.SYSTEM_PROMPT || "You are a helpful assistant.") + 
-                                         "\n\nSTRICT OUTPUT RULE: Do NOT use Markdown tables. Use bullet points or plain text formats only.";
+                } else {
+                    const systemPrompt =
+                        (process.env.SYSTEM_PROMPT || "You are a helpful assistant.") +
+                        "\n\nSTRICT OUTPUT RULE: Do NOT use Markdown tables. Use bullet points or plain text formats only.";
 
                     const answerMessages = [
                         { role: "system", content: systemPrompt },
-                        ...history
+                        ...history,
                     ];
-                    
+
                     finalResponse = await callClaudeWithRotation(answerMessages, activeModel);
                 }
 
+                // Clean up markdown for Telegram
                 let cleanReply = finalResponse
-                    .replace(/^#{1,6}\s+(.*?)$/gm, '*$1*') 
-                    .replace(/\*\*(.*?)\*\*/g, '*$1*')    
-                    .replace(/__(.*?)__/g, '*$1*')
-                    .replace(/^\s*-\s+/gm, '• ')           
-                    .replace(/^\s*[-_*]{3,}\s*$/gm, '')    
+                    .replace(/^#{1,6}\s+(.*?)$/gm, "*$1*")
+                    .replace(/\*\*(.*?)\*\*/g, "*$1*")
+                    .replace(/_(.*?)_/g, "*$1*")
+                    .replace(/^\s*-\s+/gm, "• ")
+                    .replace(/^\s*[-_*]{3,}\s*$/gm, "")
                     .trim();
 
+                // Store response with hidden search data
                 const dbContent = cleanReply + hiddenSearchData;
-                history.push({ role: 'assistant', content: dbContent });
-                
+                history.push({ role: "assistant", content: dbContent });
+
+                // Trim history if too long
                 if (history.length > 20) history = history.slice(-20);
                 await kv.set(dbKey, history);
 
+                // Send response in chunks if needed
                 const MAX_CHUNK = 4000;
                 for (let i = 0; i < cleanReply.length; i += MAX_CHUNK) {
-                    await bot.sendMessage(chatId, cleanReply.substring(i, i + MAX_CHUNK), { parse_mode: 'Markdown' });
+                    await bot.sendMessage(chatId, cleanReply.substring(i, i + MAX_CHUNK), { parse_mode: "Markdown" });
                 }
-
             } catch (error) {
+                console.error("Error:", error);
                 try {
-                    await bot.sendMessage(chatId, error.message.includes('Markdown') ? finalResponse : `⚠️ Error: ${error.message}`);
-                } catch (e) { console.error(e); }
+                    await bot.sendMessage(
+                        chatId,
+                        error.message.includes("Markdown") ? finalResponse : `⚠️ Error: ${error.message}`
+                    );
+                } catch (e) {
+                    console.error("Failed to send error message:", e);
+                }
             }
         }
-        res.status(200).json({ status: 'ok' });
+
+        res.status(200).json({ status: "ok" });
     } else {
-        res.status(200).json({ status: 'ready' });
+        res.status(200).json({ status: "ready" });
     }
 }
