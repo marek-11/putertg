@@ -111,56 +111,72 @@ export default async function handler(req, res) {
                 return res.status(200).json({});
             }
 
-            // --- COMMAND: /credits (DIRECT API VERSION) ---
+            // --- COMMAND: /credits (STABILIZED) ---
             if (userMessage === '/credits') {
-                await bot.sendChatAction(chatId, 'typing');
-                
-                const rawTokens = process.env.PUTER_AUTH_TOKEN;
-                if (!rawTokens) {
-                    await bot.sendMessage(chatId, "⚠️ No PUTER_AUTH_TOKEN configured.");
-                    return res.status(200).json({});
-                }
-
-                const tokens = rawTokens.split(',').map(t => t.trim()).filter(t => t.length > 0);
-                let report = `*📊 Puter Credits Report*\n\n`;
-
-                for (let i = 0; i < tokens.length; i++) {
-                    const token = tokens[i];
-                    const mask = `${token.slice(0, 4)}...${token.slice(-4)}`;
+                // Wrap entirely in try/catch to prevent silent bot death
+                try {
+                    await bot.sendChatAction(chatId, 'typing');
                     
-                    try {
-                        // DIRECT API CALL: Bypasses library caching issues
-                        const response = await fetch('https://api.puter.com/users/me', {
-                            method: 'GET',
-                            headers: {
-                                'Authorization': `Bearer ${token}`,
-                                'Content-Type': 'application/json'
-                            }
-                        });
-
-                        if (!response.ok) throw new Error(`API Error: ${response.status}`);
-                        const user = await response.json();
-
-                        // EXTRACT DATA
-                        const username = user.username || "Unknown";
-                        
-                        // Try various balance fields returned by the raw API
-                        let rawBalance = 0;
-                        if (user.account_balance !== undefined) rawBalance = user.account_balance;
-                        else if (user.balance !== undefined) rawBalance = user.balance;
-                        
-                        // Ensure 2 decimal places (e.g., "0.50")
-                        const balanceDisplay = `$${parseFloat(rawBalance).toFixed(2)}`;
-                        
-                        report += `*Token ${i + 1}* (${mask})\n`;
-                        report += `• User: \`${username}\`\n`;
-                        report += `• Balance: ${balanceDisplay}\n\n`;
-                    } catch (e) {
-                        report += `*Token ${i + 1}* (${mask})\n• ⚠️ Error: Fetch Failed (${e.message})\n\n`;
+                    const rawTokens = process.env.PUTER_AUTH_TOKEN;
+                    if (!rawTokens) {
+                        await bot.sendMessage(chatId, "⚠️ No PUTER_AUTH_TOKEN configured.");
+                        return res.status(200).json({});
                     }
+
+                    const tokens = rawTokens.split(',').map(t => t.trim()).filter(t => t.length > 0);
+                    let report = `*📊 Puter Account Report*\n\n`;
+
+                    for (let i = 0; i < tokens.length; i++) {
+                        const token = tokens[i];
+                        const mask = `${token.slice(0, 4)}...${token.slice(-4)}`;
+                        
+                        try {
+                            const puter = init(token);
+                            
+                            // 1. Fetch User Profile
+                            // We use Promise.allSettled to ensure one failing call doesn't stop the other
+                            const [userRes, usageRes] = await Promise.allSettled([
+                                puter.auth.getUser(),
+                                puter.auth.getMonthlyUsage ? puter.auth.getMonthlyUsage() : Promise.resolve(null)
+                            ]);
+
+                            // Process User Data (Balance)
+                            let username = "Unknown";
+                            let balanceStr = "N/A";
+                            
+                            if (userRes.status === 'fulfilled') {
+                                const u = userRes.value;
+                                username = u.username || "Unknown";
+                                // Check all known balance fields
+                                const bal = u.balance !== undefined ? u.balance : (u.account_balance || 0);
+                                balanceStr = `$${parseFloat(bal).toFixed(2)}`;
+                            }
+
+                            // Process Usage Data (Spent this month)
+                            let usageStr = "$0.00";
+                            if (usageRes.status === 'fulfilled' && usageRes.value) {
+                                const usage = usageRes.value;
+                                const cost = usage.total_cost || usage.cost || usage.amount || 0;
+                                usageStr = `$${parseFloat(cost).toFixed(2)}`;
+                            }
+
+                            report += `*Token ${i + 1}* (${mask})\n`;
+                            report += `• User: \`${username}\`\n`;
+                            report += `• Balance: ${balanceStr}\n`;
+                            report += `• Usage (Month): ${usageStr}\n\n`;
+
+                        } catch (e) {
+                            report += `*Token ${i + 1}* (${mask})\n• ⚠️ Error: Check Token\n\n`;
+                        }
+                    }
+                    
+                    await bot.sendMessage(chatId, report, { parse_mode: 'Markdown' });
+
+                } catch (fatalError) {
+                    console.error("Credits command crashed:", fatalError);
+                    await bot.sendMessage(chatId, "⚠️ Error checking credits.");
                 }
                 
-                await bot.sendMessage(chatId, report, { parse_mode: 'Markdown' });
                 return res.status(200).json({});
             }
 
