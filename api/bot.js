@@ -111,7 +111,7 @@ export default async function handler(req, res) {
                 return res.status(200).json({});
             }
 
-            // --- COMMAND: /credits (DOCS IMPLEMENTATION) ---
+            // --- COMMAND: /credits (UPDATED) ---
             if (userMessage === '/credits') {
                 try {
                     await bot.sendChatAction(chatId, 'typing');
@@ -124,6 +124,7 @@ export default async function handler(req, res) {
 
                     const tokens = rawTokens.split(',').map(t => t.trim()).filter(t => t.length > 0);
                     let report = `*📊 Puter Wallet Report*\n\n`;
+                    let grandTotal = 0.0;
 
                     for (let i = 0; i < tokens.length; i++) {
                         const token = tokens[i];
@@ -140,26 +141,20 @@ export default async function handler(req, res) {
                             } catch (e) {}
 
                             // 2. Get Balance via MonthlyUsage (Microcents)
-                            // Ref: puter.auth.getMonthlyUsage() returns object with allowanceInfo
                             let balanceStr = "N/A";
-                            let usedStr = "N/A";
 
                             try {
-                                const usageData = await puter.auth.getMonthlyUsage(); //
+                                const usageData = await puter.auth.getMonthlyUsage();
                                 
                                 if (usageData && usageData.allowanceInfo) {
-                                    // Calculate Remaining Balance
                                     // Formula: microcents / 100,000,000 = USD
                                     const remainingMicro = usageData.allowanceInfo.remaining || 0;
                                     const remainingUSD = remainingMicro / 100000000;
+                                    
                                     balanceStr = `$${remainingUSD.toFixed(2)}`;
-
-                                    // Calculate Amount Used (Optional context)
-                                    // Total Allowance - Remaining = Used
-                                    const totalMicro = usageData.allowanceInfo.monthUsageAllowance || 0;
-                                    const usedMicro = totalMicro - remainingMicro;
-                                    const usedUSD = usedMicro / 100000000;
-                                    usedStr = `$${usedUSD.toFixed(2)}`;
+                                    
+                                    // Add to Grand Total
+                                    grandTotal += remainingUSD;
                                 }
                             } catch (e) {
                                 console.log('Usage fetch failed', e);
@@ -167,14 +162,17 @@ export default async function handler(req, res) {
 
                             report += `*Token ${i + 1}* (${mask})\n`;
                             report += `• User: \`${username}\`\n`;
-                            report += `• Available Balance: *${balanceStr}*\n`;
-                            report += `• Used this Month: ${usedStr}\n\n`;
+                            report += `• Available: *${balanceStr}*\n\n`;
 
                         } catch (e) {
                             report += `*Token ${i + 1}* (${mask})\n• ⚠️ Error: Invalid Token\n\n`;
                         }
                     }
                     
+                    // Add Total Balance Footer
+                    report += `-----------------------------\n`;
+                    report += `*💰 TOTAL BALANCE: $${grandTotal.toFixed(2)}*`;
+
                     await bot.sendMessage(chatId, report, { parse_mode: 'Markdown' });
 
                 } catch (fatalError) {
