@@ -8,9 +8,10 @@ async function callClaudeWithRotation(messages) {
     const rawTokens = process.env.PUTER_AUTH_TOKEN;
     if (!rawTokens) throw new Error("Missing PUTER_AUTH_TOKEN env var.");
 
+    // Split by comma to support multiple tokens
     let tokens = rawTokens.split(',').map(t => t.trim()).filter(t => t.length > 0);
     
-    // Shuffle
+    // Shuffle for load balancing
     for (let i = tokens.length - 1; i > 0; i--) {
         const j = Math.floor(Math.random() * (i + 1));
         [tokens[i], tokens[j]] = [tokens[j], tokens[i]];
@@ -42,6 +43,7 @@ async function callClaudeWithRotation(messages) {
             }
             text = text.trim();
 
+            // Simple quota check based on error text
             if (text.length < 150) {
                 const lower = text.toLowerCase();
                 const failPhrases = ["usage limit", "quota", "insufficient credit", "out of credits", "rate limit"];
@@ -97,33 +99,76 @@ export default async function handler(req, res) {
             const userMessage = body.message.text.trim();
             const dbKey = `chat_history:${chatId}`;
 
+            // 1. Whitelist Check
             const allowed = (process.env.WHITELIST || "").split(',').map(i => i.trim());
             if (allowed.length > 0 && !allowed.includes(chatId.toString())) {
                 return res.status(200).json({});
             }
+
+            // 2. Command: /start
             if (userMessage === '/start') {
-                await bot.sendMessage(chatId, "Hi");
+                await bot.sendMessage(chatId, "Hi! I am ready.");
                 return res.status(200).json({});
             }
+
+            // 3. Command: /clear
             if (userMessage === '/clear') {
                 await kv.set(dbKey, []);
                 await bot.sendMessage(chatId, "✅ Memory cleared.");
                 return res.status(200).json({});
             }
 
+            // 4. Command: /credits (NEW)
+            if (userMessage === '/credits') {
+                await bot.sendChatAction(chatId, 'typing');
+                
+                const rawTokens = process.env.PUTER_AUTH_TOKEN;
+                if (!rawTokens) {
+                    await bot.sendMessage(chatId, "⚠️ No PUTER_AUTH_TOKEN configured.");
+                    return res.status(200).json({});
+                }
+
+                const tokens = rawTokens.split(',').map(t => t.trim()).filter(t => t.length > 0);
+                let report = `*📊 Puter Credits Report*\n\n`;
+
+                for (let i = 0; i < tokens.length; i++) {
+                    const token = tokens[i];
+                    const mask = `${token.slice(0, 4)}...${token.slice(-4)}`;
+                    
+                    try {
+                        const puter = init(token);
+                        // Fetch user info
+                        const user = await puter.auth.getUser();
+                        
+                        // Check for balance/credits fields (API structure may vary)
+                        const balance = user.balance !== undefined ? user.balance : (user.account_balance || "N/A");
+                        const username = user.username || "Unknown";
+                        
+                        report += `*Token ${i + 1}* (${mask})\n`;
+                        report += `• User: \`${username}\`\n`;
+                        report += `• Balance: ${balance}\n\n`;
+                    } catch (e) {
+                        report += `*Token ${i + 1}* (${mask})\n• ⚠️ Error: Invalid or Expired\n\n`;
+                    }
+                }
+                
+                await bot.sendMessage(chatId, report, { parse_mode: 'Markdown' });
+                return res.status(200).json({});
+            }
+
+            // 5. Normal Chat Flow
             await bot.sendChatAction(chatId, 'typing');
 
             try {
                 let history = await kv.get(dbKey) || [];
                 history.push({ role: 'user', content: userMessage });
 
-                // 1. GET DATE
                 const now = new Date();
                 const dateString = now.toLocaleDateString("en-US", { 
                     weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' 
                 });
 
-                // 2. ROUTER PHASE
+                // Router Phase
                 const routerPrompt = `Current Date: ${dateString}
 
 You are a classification tool. Look at the CONVERSATION HISTORY.
@@ -150,7 +195,6 @@ User: "Write a poem" -> DIRECT_ANSWER`;
                 let finalResponse = "";
                 let hiddenSearchData = ""; 
 
-                // 3. EXECUTION PHASE
                 if (routerResponse.trim().startsWith("SEARCH:")) {
                     const searchQuery = routerResponse.replace("SEARCH:", "").trim();
                     await bot.sendChatAction(chatId, 'typing'); 
@@ -161,7 +205,7 @@ User: "Write a poem" -> DIRECT_ANSWER`;
                         hiddenSearchData = `\n\n:::SEARCH_CONTEXT:::\nQuery: ${searchQuery}\n${searchResults}\n:::END_SEARCH_CONTEXT:::`;
                     }
 
-                    // --- UPDATED: ADDED "NO TABLES" RULE HERE ---
+                    // STRICT NO TABLES RULE
                     const contextMsg = {
                         role: "system",
                         content: `[SYSTEM DATA]\nDate: ${dateString}\nSearch Query: "${searchQuery}"\nResults:\n${searchResults || "No results found."}\n\nInstruction: Answer the user's question directly using these results.\n\nCRITICAL STYLE RULE: Do NOT say "Based on the search results". Answer confidently. STRICTLY NO MARKDOWN TABLES. Use bullet points or plain text lists instead.`
@@ -177,7 +221,7 @@ User: "Write a poem" -> DIRECT_ANSWER`;
                     finalResponse = await callClaudeWithRotation(answerMessages);
                 } 
                 else {
-                    // --- UPDATED: ADDED "NO TABLES" RULE HERE ---
+                    // STRICT NO TABLES RULE
                     const systemPrompt = (process.env.SYSTEM_PROMPT || "You are a helpful assistant.") + 
                                          "\n\nSTRICT OUTPUT RULE: Do NOT use Markdown tables. Use bullet points or plain text formats only.";
 
@@ -188,7 +232,7 @@ User: "Write a poem" -> DIRECT_ANSWER`;
                     finalResponse = await callClaudeWithRotation(answerMessages);
                 }
 
-                // 4. CLEANUP & REPLY
+                // Cleanup & Reply
                 let cleanReply = finalResponse
                     .replace(/^#{1,6}\s+(.*?)$/gm, '*$1*') 
                     .replace(/\*\*(.*?)\*\*/g, '*$1*')    
@@ -204,7 +248,6 @@ User: "Write a poem" -> DIRECT_ANSWER`;
                 if (history.length > 20) history = history.slice(-20);
                 await kv.set(dbKey, history);
 
-                // 6. SEND TO USER
                 const MAX_CHUNK = 4000;
                 for (let i = 0; i < cleanReply.length; i += MAX_CHUNK) {
                     await bot.sendMessage(chatId, cleanReply.substring(i, i + MAX_CHUNK), { parse_mode: 'Markdown' });
