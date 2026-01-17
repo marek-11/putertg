@@ -7,6 +7,17 @@ const { init } = require('@heyputer/puter.js/src/init.cjs');
 const DEFAULT_MODEL = 'claude-opus-4-5'; // Main "Thinking" Brain
 const ROUTER_MODEL = 'gpt-4o';           // Fast "Decision" Brain
 
+// Map user flags to real Puter Model IDs
+const IMAGE_MODELS = {
+    'default': 'black-forest-labs/FLUX.1-schnell',
+    '--flux':  'black-forest-labs/FLUX.1-schnell',
+    '--dev':   'black-forest-labs/FLUX.1-dev',
+    '--google': 'gemini-2.5-flash-image-preview', // "Nano Banana"
+    '--nano':   'gemini-2.5-flash-image-preview',
+    '--dalle':  'dall-e-3',
+    '--sd':     'stabilityai/stable-diffusion-xl-base-1.0'
+};
+
 // --- HELPER 1: GET ALL TOKENS (ENV + DB) ---
 async function getAllTokens() {
     const rawStatic = process.env.PUTER_AUTH_TOKEN || "";
@@ -236,12 +247,9 @@ export default async function handler(req, res) {
                 return res.status(200).json({});
             }
 
-            // --- 3. TOKEN MANAGEMENT (MULTI-DELETE) ---
+            // --- 3. TOKEN MANAGEMENT ---
             if (userMessage.startsWith('/deltoken') || userMessage.startsWith('/deltokens')) {
-                // Remove command part (matches /deltoken or /deltokens) and trim
                 const args = userMessage.replace(/^\/deltokens?/, '').trim();
-                
-                // Split by comma or space to get numbers (1, 2, 3)
                 const indices = args.split(/[\s,]+/).map(n => parseInt(n.trim())).filter(n => !isNaN(n));
 
                 if (indices.length === 0) {
@@ -249,7 +257,6 @@ export default async function handler(req, res) {
                     return res.status(200).json({});
                 }
 
-                // Reconstruct combined list to identify tokens
                 const rawStatic = process.env.PUTER_AUTH_TOKEN || "";
                 const staticTokens = rawStatic.split(',').map(t => t.trim()).filter(Boolean);
                 let dynamicTokens = await kv.get('extra_tokens') || [];
@@ -259,42 +266,84 @@ export default async function handler(req, res) {
                 const errors = [];
 
                 for (const idx of indices) {
-                    const targetIndex = idx - 1; // Convert 1-based user input to 0-based array index
-                    
+                    const targetIndex = idx - 1;
                     if (targetIndex < 0 || targetIndex >= combined.length) {
                         errors.push(`#${idx} (Not found)`);
                         continue;
                     }
-
                     const tokenStr = combined[targetIndex];
-
-                    // Check if it's an ENV token
                     if (staticTokens.includes(tokenStr)) {
                         errors.push(`#${idx} (ENV var)`);
                         continue;
                     }
-
                     tokensToDelete.push(tokenStr);
                 }
 
                 if (tokensToDelete.length > 0) {
-                    // Filter out the deleted tokens
                     const newDynamic = dynamicTokens.filter(t => !tokensToDelete.includes(t));
                     await kv.set('extra_tokens', newDynamic);
-                    
                     let msg = `✅ *Deleted ${tokensToDelete.length} token(s).*`;
-                    if (errors.length > 0) {
-                        msg += `\n\n⚠️ Skipped:\n${errors.join('\n')}`;
-                    }
+                    if (errors.length > 0) msg += `\n\n⚠️ Skipped:\n${errors.join('\n')}`;
                     await bot.sendMessage(chatId, msg, {parse_mode: 'Markdown'});
                 } else {
                     await bot.sendMessage(chatId, `⚠️ No tokens deleted.\nReason: ${errors.join(', ')}`);
                 }
-
                 return res.status(200).json({});
             }
 
-            // --- 4. ADVANCED COMMANDS ---
+            // --- 4. IMAGE GENERATION (NEW) ---
+            if (userMessage.startsWith('/image')) {
+                let prompt = userMessage.replace('/image', '').trim();
+                
+                // Determine model
+                let selectedModel = IMAGE_MODELS['default'];
+                let modelName = 'Flux (Default)';
+
+                // Check for flags
+                for (const flag of Object.keys(IMAGE_MODELS)) {
+                    if (prompt.startsWith(flag)) {
+                        selectedModel = IMAGE_MODELS[flag];
+                        modelName = flag;
+                        prompt = prompt.replace(flag, '').trim();
+                        break;
+                    }
+                }
+
+                if (!prompt) {
+                    const flags = Object.keys(IMAGE_MODELS).filter(k => k !== 'default').join(', ');
+                    await bot.sendMessage(chatId, 
+                        `⚠️ *Usage:* \`/image [flag] <description>\`\n\n` + 
+                        `*Available Flags:*\n\`${flags}\`\n\n` +
+                        `*Example:* \`/image --google a futuristic city\``, 
+                        {parse_mode: 'Markdown'}
+                    );
+                    return res.status(200).json({});
+                }
+
+                await bot.sendChatAction(chatId, 'upload_photo');
+                
+                try {
+                    const tokens = await getAllTokens();
+                    // Simple random shuffle for load balancing
+                    const token = tokens[Math.floor(Math.random() * tokens.length)];
+                    
+                    const puter = init(token);
+                    const imageObj = await puter.ai.txt2img(prompt, { model: selectedModel });
+                    const imageUrl = imageObj.src || imageObj;
+
+                    await bot.sendPhoto(chatId, imageUrl, {
+                        caption: `🎨 *Generated by ${modelName}:*\n${prompt}`,
+                        parse_mode: 'Markdown'
+                    });
+
+                } catch (e) {
+                    console.error(e);
+                    await bot.sendMessage(chatId, `⚠️ Image failed (${modelName}): ${e.message}`);
+                }
+                return res.status(200).json({});
+            }
+
+            // --- 5. ADVANCED COMMANDS ---
             if (userMessage === '/bal') {
                 try {
                     await bot.sendChatAction(chatId, 'typing');
@@ -320,7 +369,6 @@ export default async function handler(req, res) {
             if (userMessage === '/credits') {
                 try {
                     await bot.sendChatAction(chatId, 'typing');
-                    
                     const rawStatic = process.env.PUTER_AUTH_TOKEN || "";
                     const staticTokens = rawStatic.split(',').map(t => t.trim()).filter(Boolean);
                     
@@ -417,7 +465,7 @@ export default async function handler(req, res) {
                 return res.status(200).json({});
             }
 
-            // --- 5. CHAT FLOW ---
+            // --- 6. CHAT FLOW ---
             await bot.sendChatAction(chatId, 'typing');
 
             try {
