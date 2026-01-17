@@ -236,7 +236,47 @@ export default async function handler(req, res) {
                 return res.status(200).json({});
             }
 
-            // --- 3. ADVANCED COMMANDS (/bal, /credits, /models) ---
+            // --- 3. TOKEN MANAGEMENT ---
+            
+            // NEW: Individual Token Deletion
+            if (userMessage.startsWith('/deltoken')) {
+                const targetIndex = parseInt(userMessage.split(' ')[1]) - 1;
+                if (isNaN(targetIndex)) {
+                    await bot.sendMessage(chatId, "⚠️ Usage: `/deltoken <number>`\nCheck /credits for the number.", {parse_mode: 'Markdown'});
+                    return res.status(200).json({});
+                }
+
+                // Reconstruct combined list to find the exact token string
+                const rawStatic = process.env.PUTER_AUTH_TOKEN || "";
+                const staticTokens = rawStatic.split(',').map(t => t.trim()).filter(Boolean);
+                const dynamicTokens = await kv.get('extra_tokens') || [];
+                const combined = [...new Set([...staticTokens, ...dynamicTokens])];
+
+                if (targetIndex < 0 || targetIndex >= combined.length) {
+                    await bot.sendMessage(chatId, "⚠️ Invalid Token Number.");
+                    return res.status(200).json({});
+                }
+
+                const tokenToRemove = combined[targetIndex];
+
+                // Guard: Cannot delete env tokens
+                if (staticTokens.includes(tokenToRemove)) {
+                    await bot.sendMessage(chatId, "⚠️ Cannot delete a token loaded from Environment Variables (marked [ENV]).");
+                    return res.status(200).json({});
+                }
+
+                // Remove from DB
+                const newDynamic = dynamicTokens.filter(t => t !== tokenToRemove);
+                if (newDynamic.length === dynamicTokens.length) {
+                    await bot.sendMessage(chatId, "⚠️ Token not found in database.");
+                } else {
+                    await kv.set('extra_tokens', newDynamic);
+                    await bot.sendMessage(chatId, `✅ Token #${targetIndex + 1} deleted.`);
+                }
+                return res.status(200).json({});
+            }
+
+            // --- 4. ADVANCED COMMANDS ---
             if (userMessage === '/bal') {
                 try {
                     await bot.sendChatAction(chatId, 'typing');
@@ -249,7 +289,7 @@ export default async function handler(req, res) {
                             if (usageData?.allowanceInfo?.remaining) {
                                 grandTotal += (usageData.allowanceInfo.remaining / 100000000);
                             }
-                        } catch (e) { /* ignore invalid tokens */ }
+                        } catch (e) { /* ignore */ }
                     }
                     const msg = `*💰 Balance Summary*\n\n• Total # of tokens: \`${tokens.length}\`\n• Total Balance: \`$${grandTotal.toFixed(2)}\``;
                     await bot.sendMessage(chatId, msg, { parse_mode: 'Markdown' });
@@ -262,6 +302,11 @@ export default async function handler(req, res) {
             if (userMessage === '/credits') {
                 try {
                     await bot.sendChatAction(chatId, 'typing');
+                    
+                    // Need to distinguish Static vs Dynamic for the label
+                    const rawStatic = process.env.PUTER_AUTH_TOKEN || "";
+                    const staticTokens = rawStatic.split(',').map(t => t.trim()).filter(Boolean);
+                    
                     const tokens = await getAllTokens();
                     let report = `*📊 Detailed Report*\n\n`;
                     let grandTotal = 0.0;
@@ -269,6 +314,9 @@ export default async function handler(req, res) {
                     for (let i = 0; i < tokens.length; i++) {
                         const token = tokens[i];
                         const mask = `${token.slice(0, 4)}...${token.slice(-4)}`;
+                        const isEnv = staticTokens.includes(token);
+                        const sourceLabel = isEnv ? "`[ENV]`" : "`[DB]`";
+
                         try {
                             const puter = init(token);
                             let username = "Unknown";
@@ -286,15 +334,18 @@ export default async function handler(req, res) {
                                     grandTotal += usd;
                                 }
                             } catch (e) {}
-                            report += `*Token ${i + 1}* (${mask})\n`;
+                            
+                            report += `*Token ${i + 1}* ${sourceLabel} (${mask})\n`;
                             report += `• User: \`${username}\`\n`;
                             report += `• Available: *${balanceStr}*\n\n`;
                         } catch (e) {
-                            report += `*Token ${i + 1}* (${mask})\n• ⚠️ Error: Invalid\n\n`;
+                            report += `*Token ${i + 1}* ${sourceLabel} (${mask})\n• ⚠️ Error: Invalid\n\n`;
                         }
                     }
                     report += `-----------------------------\n`;
-                    report += `*💰 TOTAL: $${grandTotal.toFixed(2)}*`;
+                    report += `*💰 TOTAL: $${grandTotal.toFixed(2)}*\n\n`;
+                    report += `_To delete a DB token, use:_\n\`/deltoken <number>\``;
+                    
                     await bot.sendMessage(chatId, report, { parse_mode: 'Markdown' });
                 } catch (e) {
                     await bot.sendMessage(chatId, `⚠️ Error: ${e.message}`);
@@ -349,7 +400,7 @@ export default async function handler(req, res) {
                 return res.status(200).json({});
             }
 
-            // --- 4. CHAT FLOW ---
+            // --- 5. CHAT FLOW ---
             await bot.sendChatAction(chatId, 'typing');
 
             try {
@@ -370,9 +421,7 @@ export default async function handler(req, res) {
                     const searchResults = await performExaResearch(intent.query);
                     
                     if (searchResults) {
-                        // Store specifically for history logs
                         hiddenSearchData = `\n\n[Search Query: ${intent.query}]\n`;
-                        // Simply inject the data into the system prompt.
                         systemContext += `\n\n[Context from Web Search]:\n${searchResults}`;
                     }
                 }
@@ -396,7 +445,7 @@ export default async function handler(req, res) {
                 if (history.length > 20) history = history.slice(-20);
                 await kv.set(dbKey, history);
 
-                // --- SMART SPLITTER (Fixes 400 Bad Request) ---
+                // --- SMART SPLITTER ---
                 let remaining = cleanReply;
                 while (remaining.length > 0) {
                     let chunk;
@@ -404,17 +453,14 @@ export default async function handler(req, res) {
                         chunk = remaining;
                         remaining = "";
                     } else {
-                        // Split at the last newline before 4000 limit to preserve Markdown tags
                         let splitAt = remaining.lastIndexOf('\n', 4000);
-                        if (splitAt === -1) splitAt = 4000; // Hard split if no newline found
+                        if (splitAt === -1) splitAt = 4000;
                         chunk = remaining.slice(0, splitAt);
                         remaining = remaining.slice(splitAt).trim();
                     }
-
                     try {
                         await bot.sendMessage(chatId, chunk, { parse_mode: 'Markdown' });
                     } catch (e) {
-                        // Fallback: If Markdown parsing fails (e.g. split tag), send as plain text
                         await bot.sendMessage(chatId, chunk);
                     }
                 }
