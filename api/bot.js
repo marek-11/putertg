@@ -126,7 +126,7 @@ async function performExaResearch(userQuery) {
             body: JSON.stringify({ 
                 query: userQuery,
                 useAutoprompt: true, 
-                numResults: 2, // Reduced to 2 for speed/cost, increase if needed
+                numResults: 2, 
                 contents: { text: true } 
             })
         });
@@ -184,7 +184,7 @@ export default async function handler(req, res) {
                 return res.status(200).json({});
             }
 
-            // --- 2. COMMANDS ---
+            // --- 2. BASIC COMMANDS ---
             if (userMessage === '/start') {
                 await bot.sendMessage(chatId, "Ready.");
                 return res.status(200).json({});
@@ -207,8 +207,126 @@ export default async function handler(req, res) {
                 await bot.sendMessage(chatId, `🔄 Reset to default.`);
                 return res.status(200).json({});
             }
+            if (userMessage === '/cleartokens') {
+                await kv.set('extra_tokens', []);
+                await bot.sendMessage(chatId, "🗑️ Database tokens cleared.");
+                return res.status(200).json({});
+            }
 
-            // --- 3. CHAT FLOW ---
+            // --- 3. ADVANCED COMMANDS (/bal, /credits, /models) ---
+            if (userMessage === '/bal') {
+                try {
+                    await bot.sendChatAction(chatId, 'typing');
+                    const tokens = await getAllTokens();
+                    let grandTotal = 0.0;
+                    for (const token of tokens) {
+                        try {
+                            const puter = init(token);
+                            const usageData = await puter.auth.getMonthlyUsage();
+                            if (usageData?.allowanceInfo?.remaining) {
+                                grandTotal += (usageData.allowanceInfo.remaining / 100000000);
+                            }
+                        } catch (e) { /* ignore invalid tokens */ }
+                    }
+                    const msg = `*💰 Balance Summary*\n\n• Total # of tokens: \`${tokens.length}\`\n• Total Balance: \`$${grandTotal.toFixed(2)}\``;
+                    await bot.sendMessage(chatId, msg, { parse_mode: 'Markdown' });
+                } catch (e) {
+                    await bot.sendMessage(chatId, "⚠️ Error fetching balance.");
+                }
+                return res.status(200).json({});
+            }
+
+            if (userMessage === '/credits') {
+                try {
+                    await bot.sendChatAction(chatId, 'typing');
+                    const tokens = await getAllTokens();
+                    let report = `*📊 Detailed Report*\n\n`;
+                    let grandTotal = 0.0;
+
+                    for (let i = 0; i < tokens.length; i++) {
+                        const token = tokens[i];
+                        const mask = `${token.slice(0, 4)}...${token.slice(-4)}`;
+                        try {
+                            const puter = init(token);
+                            let username = "Unknown";
+                            try {
+                                const user = await puter.auth.getUser();
+                                username = user.username || "Unknown";
+                            } catch (e) {}
+                            let balanceStr = "N/A";
+                            try {
+                                const usageData = await puter.auth.getMonthlyUsage();
+                                if (usageData && usageData.allowanceInfo) {
+                                    const remaining = usageData.allowanceInfo.remaining || 0;
+                                    const usd = remaining / 100000000;
+                                    balanceStr = `$${usd.toFixed(2)}`;
+                                    grandTotal += usd;
+                                }
+                            } catch (e) {}
+                            report += `*Token ${i + 1}* (${mask})\n`;
+                            report += `• User: \`${username}\`\n`;
+                            report += `• Available: *${balanceStr}*\n\n`;
+                        } catch (e) {
+                            report += `*Token ${i + 1}* (${mask})\n• ⚠️ Error: Invalid\n\n`;
+                        }
+                    }
+                    report += `-----------------------------\n`;
+                    report += `*💰 TOTAL: $${grandTotal.toFixed(2)}*`;
+                    await bot.sendMessage(chatId, report, { parse_mode: 'Markdown' });
+                } catch (e) {
+                    await bot.sendMessage(chatId, `⚠️ Error: ${e.message}`);
+                }
+                return res.status(200).json({});
+            }
+
+            if (userMessage === '/models') {
+                try {
+                    await bot.sendChatAction(chatId, 'typing');
+                    const tokens = await getAllTokens();
+                    const puter = init(tokens[0]);
+                    const models = await puter.ai.listModels();
+                    
+                    const grouped = {};
+                    models.forEach(m => {
+                        const provider = m.provider || 'Other';
+                        if (!grouped[provider]) grouped[provider] = [];
+                        grouped[provider].push(m.id);
+                    });
+
+                    const sendChunk = async (text) => {
+                        if (!text.trim()) return;
+                        await bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
+                    };
+
+                    let currentBuffer = `*🤖 Available AI Models*\nUse /use <name> to switch.\n`;
+                    const MAX_SAFE_LENGTH = 3500; 
+
+                    for (const provider of Object.keys(grouped).sort()) {
+                        const header = `\n*${provider.toUpperCase()}*\n`;
+                        if (currentBuffer.length + header.length > MAX_SAFE_LENGTH) {
+                            await sendChunk(currentBuffer);
+                            currentBuffer = "";
+                        }
+                        currentBuffer += header;
+
+                        for (const id of grouped[provider].sort()) {
+                            const safeId = id.replace(/_/g, '\\_');
+                            const line = `• ${safeId}\n`;
+                            if (currentBuffer.length + line.length > MAX_SAFE_LENGTH) {
+                                await sendChunk(currentBuffer);
+                                currentBuffer = "";
+                            }
+                            currentBuffer += line;
+                        }
+                    }
+                    await sendChunk(currentBuffer);
+                } catch (e) {
+                    await bot.sendMessage(chatId, `⚠️ Could not fetch models: ${e.message}`);
+                }
+                return res.status(200).json({});
+            }
+
+            // --- 4. CHAT FLOW ---
             await bot.sendChatAction(chatId, 'typing');
 
             try {
@@ -229,17 +347,17 @@ export default async function handler(req, res) {
                     const searchResults = await performExaResearch(intent.query);
                     
                     if (searchResults) {
-                        // Store specifically for history logs so we know why it answered this way later
+                        // Store specifically for history logs
                         hiddenSearchData = `\n\n[Search Query: ${intent.query}]\n`;
                         
-                        // Simply inject the data into the system prompt. No extra instructions needed.
+                        // Simply inject the data into the system prompt.
                         systemContext += `\n\n[Context from Web Search]:\n${searchResults}`;
                     }
                 }
 
                 const answerMessages = [
                     { role: "system", content: systemContext },
-                    ...history // History already contains the latest user message
+                    ...history 
                 ];
 
                 const finalResponse = await callAIWithRotation(answerMessages, activeModel);
