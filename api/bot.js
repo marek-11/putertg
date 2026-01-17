@@ -236,43 +236,61 @@ export default async function handler(req, res) {
                 return res.status(200).json({});
             }
 
-            // --- 3. TOKEN MANAGEMENT ---
-            
-            // NEW: Individual Token Deletion
-            if (userMessage.startsWith('/deltoken')) {
-                const targetIndex = parseInt(userMessage.split(' ')[1]) - 1;
-                if (isNaN(targetIndex)) {
-                    await bot.sendMessage(chatId, "⚠️ Usage: `/deltoken <number>`\nCheck /credits for the number.", {parse_mode: 'Markdown'});
+            // --- 3. TOKEN MANAGEMENT (MULTI-DELETE) ---
+            if (userMessage.startsWith('/deltoken') || userMessage.startsWith('/deltokens')) {
+                // Remove command part (matches /deltoken or /deltokens) and trim
+                const args = userMessage.replace(/^\/deltokens?/, '').trim();
+                
+                // Split by comma or space to get numbers (1, 2, 3)
+                const indices = args.split(/[\s,]+/).map(n => parseInt(n.trim())).filter(n => !isNaN(n));
+
+                if (indices.length === 0) {
+                    await bot.sendMessage(chatId, "⚠️ Usage: `/deltoken 1` or `/deltokens 1, 2, 3`", {parse_mode: 'Markdown'});
                     return res.status(200).json({});
                 }
 
-                // Reconstruct combined list to find the exact token string
+                // Reconstruct combined list to identify tokens
                 const rawStatic = process.env.PUTER_AUTH_TOKEN || "";
                 const staticTokens = rawStatic.split(',').map(t => t.trim()).filter(Boolean);
-                const dynamicTokens = await kv.get('extra_tokens') || [];
+                let dynamicTokens = await kv.get('extra_tokens') || [];
                 const combined = [...new Set([...staticTokens, ...dynamicTokens])];
 
-                if (targetIndex < 0 || targetIndex >= combined.length) {
-                    await bot.sendMessage(chatId, "⚠️ Invalid Token Number.");
-                    return res.status(200).json({});
+                const tokensToDelete = [];
+                const errors = [];
+
+                for (const idx of indices) {
+                    const targetIndex = idx - 1; // Convert 1-based user input to 0-based array index
+                    
+                    if (targetIndex < 0 || targetIndex >= combined.length) {
+                        errors.push(`#${idx} (Not found)`);
+                        continue;
+                    }
+
+                    const tokenStr = combined[targetIndex];
+
+                    // Check if it's an ENV token
+                    if (staticTokens.includes(tokenStr)) {
+                        errors.push(`#${idx} (ENV var)`);
+                        continue;
+                    }
+
+                    tokensToDelete.push(tokenStr);
                 }
 
-                const tokenToRemove = combined[targetIndex];
-
-                // Guard: Cannot delete env tokens
-                if (staticTokens.includes(tokenToRemove)) {
-                    await bot.sendMessage(chatId, "⚠️ Cannot delete a token loaded from Environment Variables (marked [ENV]).");
-                    return res.status(200).json({});
-                }
-
-                // Remove from DB
-                const newDynamic = dynamicTokens.filter(t => t !== tokenToRemove);
-                if (newDynamic.length === dynamicTokens.length) {
-                    await bot.sendMessage(chatId, "⚠️ Token not found in database.");
-                } else {
+                if (tokensToDelete.length > 0) {
+                    // Filter out the deleted tokens
+                    const newDynamic = dynamicTokens.filter(t => !tokensToDelete.includes(t));
                     await kv.set('extra_tokens', newDynamic);
-                    await bot.sendMessage(chatId, `✅ Token #${targetIndex + 1} deleted.`);
+                    
+                    let msg = `✅ *Deleted ${tokensToDelete.length} token(s).*`;
+                    if (errors.length > 0) {
+                        msg += `\n\n⚠️ Skipped:\n${errors.join('\n')}`;
+                    }
+                    await bot.sendMessage(chatId, msg, {parse_mode: 'Markdown'});
+                } else {
+                    await bot.sendMessage(chatId, `⚠️ No tokens deleted.\nReason: ${errors.join(', ')}`);
                 }
+
                 return res.status(200).json({});
             }
 
@@ -303,7 +321,6 @@ export default async function handler(req, res) {
                 try {
                     await bot.sendChatAction(chatId, 'typing');
                     
-                    // Need to distinguish Static vs Dynamic for the label
                     const rawStatic = process.env.PUTER_AUTH_TOKEN || "";
                     const staticTokens = rawStatic.split(',').map(t => t.trim()).filter(Boolean);
                     
@@ -344,7 +361,7 @@ export default async function handler(req, res) {
                     }
                     report += `-----------------------------\n`;
                     report += `*💰 TOTAL: $${grandTotal.toFixed(2)}*\n\n`;
-                    report += `_To delete a DB token, use:_\n\`/deltoken <number>\``;
+                    report += `_To delete, use:_\n\`/deltokens 1, 2, 3\``;
                     
                     await bot.sendMessage(chatId, report, { parse_mode: 'Markdown' });
                 } catch (e) {
