@@ -203,14 +203,12 @@ export default async function handler(req, res) {
                 return res.status(200).json({});
             }
 
-            // --- UPDATED RESET COMMAND ---
             if (userMessage === '/reset') {
                 await kv.del(modelKey);
                 await bot.sendMessage(chatId, `🔄 Reverted to the default model: \`${DEFAULT_MODEL}\``, {parse_mode: 'Markdown'});
                 return res.status(200).json({});
             }
 
-            // --- NEW STAT COMMAND ---
             if (userMessage === '/stat') {
                 try {
                     await bot.sendChatAction(chatId, 'typing');
@@ -374,7 +372,6 @@ export default async function handler(req, res) {
                     if (searchResults) {
                         // Store specifically for history logs
                         hiddenSearchData = `\n\n[Search Query: ${intent.query}]\n`;
-                        
                         // Simply inject the data into the system prompt.
                         systemContext += `\n\n[Context from Web Search]:\n${searchResults}`;
                     }
@@ -399,9 +396,27 @@ export default async function handler(req, res) {
                 if (history.length > 20) history = history.slice(-20);
                 await kv.set(dbKey, history);
 
-                const MAX_CHUNK = 4000;
-                for (let i = 0; i < cleanReply.length; i += MAX_CHUNK) {
-                    await bot.sendMessage(chatId, cleanReply.substring(i, i + MAX_CHUNK), { parse_mode: 'Markdown' });
+                // --- SMART SPLITTER (Fixes 400 Bad Request) ---
+                let remaining = cleanReply;
+                while (remaining.length > 0) {
+                    let chunk;
+                    if (remaining.length <= 4000) {
+                        chunk = remaining;
+                        remaining = "";
+                    } else {
+                        // Split at the last newline before 4000 limit to preserve Markdown tags
+                        let splitAt = remaining.lastIndexOf('\n', 4000);
+                        if (splitAt === -1) splitAt = 4000; // Hard split if no newline found
+                        chunk = remaining.slice(0, splitAt);
+                        remaining = remaining.slice(splitAt).trim();
+                    }
+
+                    try {
+                        await bot.sendMessage(chatId, chunk, { parse_mode: 'Markdown' });
+                    } catch (e) {
+                        // Fallback: If Markdown parsing fails (e.g. split tag), send as plain text
+                        await bot.sendMessage(chatId, chunk);
+                    }
                 }
 
             } catch (error) {
