@@ -8,7 +8,7 @@ const DEFAULT_MODEL = 'claude-opus-4-5'; // Main "Thinking" Brain
 const ROUTER_MODEL = 'gpt-4o';           // Fast "Decision" Brain
 
 // --- IMAGE MODEL MAPPING ---
-// Removed all other models. Default is now set to Flux Dev (High Quality).
+// Default set to Flux Dev (High Quality).
 const IMAGE_MODELS = {
     'default': 'black-forest-labs/FLUX.1-dev'
 };
@@ -155,6 +155,26 @@ async function performExaResearch(userQuery) {
     }
 }
 
+// --- HELPER 5: MARKDOWN TO HTML CONVERTER ---
+function formatToHtml(text) {
+    if (!text) return "";
+    return text
+        // 1. Escape HTML reserved characters
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        // 2. Code Blocks (```code```) -> <pre>
+        .replace(/```([\s\S]*?)```/g, '<pre>$1</pre>')
+        // 3. Inline Code (`code`) -> <code>
+        .replace(/`([^`]+)`/g, '<code>$1</code>')
+        // 4. Headers (# Header) -> <b>
+        .replace(/^#{1,6}\s+(.*?)$/gm, '<b>$1</b>')
+        // 5. Bold (**Text**) -> <b>
+        .replace(/\*\*(.*?)\*\*/g, '<b>$1</b>')
+        // 6. Italic (*Text*) -> <i> (Avoid matching list bullets like * Item)
+        .replace(/(?<!\*)\*([^\s*][^*]*?)\*(?!\*)/g, '<i>$1</i>');
+}
+
 // --- MAIN HANDLER ---
 export default async function handler(req, res) {
     const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN);
@@ -182,7 +202,7 @@ export default async function handler(req, res) {
                     } else {
                         currentExtras.push(userMessage);
                         await kv.set('extra_tokens', currentExtras);
-                        await bot.sendMessage(chatId, `✅ *Token Added!*`, {parse_mode: 'Markdown'});
+                        await bot.sendMessage(chatId, `✅ <b>Token Added!</b>`, {parse_mode: 'HTML'});
                     }
                 } catch (e) {
                     await bot.sendMessage(chatId, `❌ Error: ${e.message}`);
@@ -204,14 +224,14 @@ export default async function handler(req, res) {
                 const newModel = userMessage.replace('/use', '').trim();
                 if (newModel) {
                     await kv.set(modelKey, newModel);
-                    await bot.sendMessage(chatId, `✅ Switched to: \`${newModel}\``, {parse_mode: 'Markdown'});
+                    await bot.sendMessage(chatId, `✅ Switched to: <code>${newModel}</code>`, {parse_mode: 'HTML'});
                 }
                 return res.status(200).json({});
             }
 
             if (userMessage === '/reset') {
                 await kv.del(modelKey);
-                await bot.sendMessage(chatId, `🔄 Reverted to the default model: \`${DEFAULT_MODEL}\``, {parse_mode: 'Markdown'});
+                await bot.sendMessage(chatId, `🔄 Reverted to the default model: <code>${DEFAULT_MODEL}</code>`, {parse_mode: 'HTML'});
                 return res.status(200).json({});
             }
 
@@ -223,13 +243,13 @@ export default async function handler(req, res) {
                     const history = await kv.get(dbKey) || [];
                     const tokens = await getAllTokens();
 
-                    const statMsg = `*ℹ️ System Status*\n\n` +
-                                    `• *Current Model:* \`${currentModel}\` ${storedModel ? '(User Set)' : '(Default)'}\n` +
-                                    `• *Memory Depth:* \`${history.length}\` messages\n` +
-                                    `• *Active Tokens:* \`${tokens.length}\`\n` +
-                                    `• *Router Model:* \`${ROUTER_MODEL}\``;
+                    const statMsg = `<b>ℹ️ System Status</b>\n\n` +
+                                    `• <b>Current Model:</b> <code>${currentModel}</code> ${storedModel ? '(User Set)' : '(Default)'}\n` +
+                                    `• <b>Memory Depth:</b> <code>${history.length}</code> messages\n` +
+                                    `• <b>Active Tokens:</b> <code>${tokens.length}</code>\n` +
+                                    `• <b>Router Model:</b> <code>${ROUTER_MODEL}</code>`;
 
-                    await bot.sendMessage(chatId, statMsg, {parse_mode: 'Markdown'});
+                    await bot.sendMessage(chatId, statMsg, {parse_mode: 'HTML'});
                 } catch (e) {
                     await bot.sendMessage(chatId, `⚠️ Error fetching stats: ${e.message}`);
                 }
@@ -248,7 +268,7 @@ export default async function handler(req, res) {
                 const indices = args.split(/[\s,]+/).map(n => parseInt(n.trim())).filter(n => !isNaN(n));
 
                 if (indices.length === 0) {
-                    await bot.sendMessage(chatId, "⚠️ Usage: `/deltoken 1` or `/deltokens 1, 2, 3`", {parse_mode: 'Markdown'});
+                    await bot.sendMessage(chatId, "⚠️ Usage: <code>/deltoken 1</code> or <code>/deltokens 1, 2, 3</code>", {parse_mode: 'HTML'});
                     return res.status(200).json({});
                 }
 
@@ -277,41 +297,38 @@ export default async function handler(req, res) {
                 if (tokensToDelete.length > 0) {
                     const newDynamic = dynamicTokens.filter(t => !tokensToDelete.includes(t));
                     await kv.set('extra_tokens', newDynamic);
-                    let msg = `✅ *Deleted ${tokensToDelete.length} token(s).*`;
+                    let msg = `✅ <b>Deleted ${tokensToDelete.length} token(s).</b>`;
                     if (errors.length > 0) msg += `\n\n⚠️ Skipped:\n${errors.join('\n')}`;
-                    await bot.sendMessage(chatId, msg, {parse_mode: 'Markdown'});
+                    await bot.sendMessage(chatId, msg, {parse_mode: 'HTML'});
                 } else {
                     await bot.sendMessage(chatId, `⚠️ No tokens deleted.\nReason: ${errors.join(', ')}`);
                 }
                 return res.status(200).json({});
             }
 
-            // --- 4. IMAGE GENERATION (SIMPLIFIED: FLUX DEV ONLY) ---
+            // --- 4. IMAGE GENERATION (FLUX DEV ONLY) ---
             if (userMessage.startsWith('/image')) {
                 let prompt = userMessage.replace('/image', '').trim();
-                
-                // Always use default (Flux Dev) since others are removed
                 let selectedModel = IMAGE_MODELS['default'];
                 let modelName = 'Flux Dev';
 
                 if (!prompt) {
                     await bot.sendMessage(chatId, 
-                        `⚠️ *Usage:* \`/image <description>\`\n\n` + 
-                        `*Example:* \`/image a futuristic city\``, 
-                        {parse_mode: 'Markdown'}
+                        `⚠️ <b>Usage:</b> <code>/image &lt;description&gt;</code>\n\n` + 
+                        `<b>Example:</b> <code>/image a futuristic city</code>`, 
+                        {parse_mode: 'HTML'}
                     );
                     return res.status(200).json({});
                 }
 
                 await bot.sendChatAction(chatId, 'upload_photo');
                 
-                // --- GENERATION FUNCTION ---
-                const generateAndSend = async (mId, mName, pmt) => {
+                try {
                     const tokens = await getAllTokens();
                     const token = tokens[Math.floor(Math.random() * tokens.length)];
                     const puter = init(token);
                     
-                    const imageResult = await puter.ai.txt2img(pmt, { model: mId });
+                    const imageResult = await puter.ai.txt2img(prompt, { model: selectedModel });
                     
                     let src = imageResult?.src || imageResult;
                     if (typeof src !== 'string') throw new Error(`Invalid response type: ${typeof src}`);
@@ -326,14 +343,13 @@ export default async function handler(req, res) {
                         finalImage = Buffer.from(src, 'base64');
                     }
 
+                    // Safe Caption using HTML
+                    const safePrompt = prompt.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
                     await bot.sendPhoto(chatId, finalImage, {
-                        caption: `🎨 *Generated by ${mName}:*\n${pmt}`,
-                        parse_mode: 'Markdown'
+                        caption: `🎨 <b>Generated by ${modelName}:</b>\n${safePrompt}`,
+                        parse_mode: 'HTML'
                     });
-                };
 
-                try {
-                    await generateAndSend(selectedModel, modelName, prompt);
                 } catch (e) {
                     console.warn(`Image failed:`, e.message);
                     await bot.sendMessage(chatId, `❌ Image failed: ${e.message}`);
@@ -356,8 +372,8 @@ export default async function handler(req, res) {
                             }
                         } catch (e) { /* ignore */ }
                     }
-                    const msg = `*💰 Balance Summary*\n\n• Total # of tokens: \`${tokens.length}\`\n• Total Balance: \`$${grandTotal.toFixed(2)}\``;
-                    await bot.sendMessage(chatId, msg, { parse_mode: 'Markdown' });
+                    const msg = `<b>💰 Balance Summary</b>\n\n• Total # of tokens: <code>${tokens.length}</code>\n• Total Balance: <code>$${grandTotal.toFixed(2)}</code>`;
+                    await bot.sendMessage(chatId, msg, { parse_mode: 'HTML' });
                 } catch (e) {
                     await bot.sendMessage(chatId, "⚠️ Error fetching balance.");
                 }
@@ -371,14 +387,14 @@ export default async function handler(req, res) {
                     const staticTokens = rawStatic.split(',').map(t => t.trim()).filter(Boolean);
                     
                     const tokens = await getAllTokens();
-                    let report = `*📊 Detailed Report*\n\n`;
+                    let report = `<b>📊 Detailed Report</b>\n\n`;
                     let grandTotal = 0.0;
 
                     for (let i = 0; i < tokens.length; i++) {
                         const token = tokens[i];
                         const mask = `${token.slice(0, 4)}...${token.slice(-4)}`;
                         const isEnv = staticTokens.includes(token);
-                        const sourceLabel = isEnv ? "`[ENV]`" : "`[DB]`";
+                        const sourceLabel = isEnv ? "<code>[ENV]</code>" : "<code>[DB]</code>";
 
                         try {
                             const puter = init(token);
@@ -398,18 +414,18 @@ export default async function handler(req, res) {
                                 }
                             } catch (e) {}
                             
-                            report += `*Token ${i + 1}* ${sourceLabel} (${mask})\n`;
-                            report += `• User: \`${username}\`\n`;
-                            report += `• Available: *${balanceStr}*\n\n`;
+                            report += `<b>Token ${i + 1}</b> ${sourceLabel} (${mask})\n`;
+                            report += `• User: <code>${username}</code>\n`;
+                            report += `• Available: <b>${balanceStr}</b>\n\n`;
                         } catch (e) {
-                            report += `*Token ${i + 1}* ${sourceLabel} (${mask})\n• ⚠️ Error: Invalid\n\n`;
+                            report += `<b>Token ${i + 1}</b> ${sourceLabel} (${mask})\n• ⚠️ Error: Invalid\n\n`;
                         }
                     }
                     report += `-----------------------------\n`;
-                    report += `*💰 TOTAL: $${grandTotal.toFixed(2)}*\n\n`;
-                    report += `_To delete, use:_\n\`/deltokens 1, 2, 3\``;
+                    report += `<b>💰 TOTAL: $${grandTotal.toFixed(2)}</b>\n\n`;
+                    report += `<i>To delete, use:</i>\n<code>/deltokens 1, 2, 3</code>`;
                     
-                    await bot.sendMessage(chatId, report, { parse_mode: 'Markdown' });
+                    await bot.sendMessage(chatId, report, { parse_mode: 'HTML' });
                 } catch (e) {
                     await bot.sendMessage(chatId, `⚠️ Error: ${e.message}`);
                 }
@@ -432,14 +448,14 @@ export default async function handler(req, res) {
 
                     const sendChunk = async (text) => {
                         if (!text.trim()) return;
-                        await bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
+                        await bot.sendMessage(chatId, text, { parse_mode: 'HTML' });
                     };
 
-                    let currentBuffer = `*🤖 Available AI Models*\nUse /use <name> to switch.\n`;
+                    let currentBuffer = `<b>🤖 Available AI Models</b>\nUse /use &lt;name&gt; to switch.\n`;
                     const MAX_SAFE_LENGTH = 3500; 
 
                     for (const provider of Object.keys(grouped).sort()) {
-                        const header = `\n*${provider.toUpperCase()}*\n`;
+                        const header = `\n<b>${provider.toUpperCase()}</b>\n`;
                         if (currentBuffer.length + header.length > MAX_SAFE_LENGTH) {
                             await sendChunk(currentBuffer);
                             currentBuffer = "";
@@ -447,8 +463,7 @@ export default async function handler(req, res) {
                         currentBuffer += header;
 
                         for (const id of grouped[provider].sort()) {
-                            const safeId = id.replace(/_/g, '\\_');
-                            const line = `• ${safeId}\n`;
+                            const line = `• ${id}\n`;
                             if (currentBuffer.length + line.length > MAX_SAFE_LENGTH) {
                                 await sendChunk(currentBuffer);
                                 currentBuffer = "";
@@ -496,35 +511,37 @@ export default async function handler(req, res) {
 
                 const finalResponse = await callAIWithRotation(answerMessages, activeModel);
 
-                // Formatting
-                let cleanReply = finalResponse
-                    .replace(/^#{1,6}\s+(.*?)$/gm, '*$1*') 
-                    .replace(/\*\*(.*?)\*\*/g, '*$1*')    
-                    .trim();
-
-                const dbContent = cleanReply + hiddenSearchData;
+                // --- HTML FORMATTER & DB SAVE ---
+                // We keep the raw Markdown in the DB so context doesn't get messed up with tags
+                const dbContent = finalResponse + hiddenSearchData;
                 history.push({ role: 'assistant', content: dbContent });
                 
                 if (history.length > 20) history = history.slice(-20);
                 await kv.set(dbKey, history);
 
-                // --- SMART SPLITTER ---
-                let remaining = cleanReply;
+                // Convert to HTML for Display
+                const htmlReply = formatToHtml(finalResponse.trim());
+
+                // --- SMART SPLITTER (HTML AWARE) ---
+                // Splitting by newline prevents breaking open HTML tags like <b>
+                let remaining = htmlReply;
                 while (remaining.length > 0) {
                     let chunk;
                     if (remaining.length <= 4000) {
                         chunk = remaining;
                         remaining = "";
                     } else {
+                        // Split at the last newline before 4000 limit
                         let splitAt = remaining.lastIndexOf('\n', 4000);
                         if (splitAt === -1) splitAt = 4000;
                         chunk = remaining.slice(0, splitAt);
                         remaining = remaining.slice(splitAt).trim();
                     }
                     try {
-                        await bot.sendMessage(chatId, chunk, { parse_mode: 'Markdown' });
+                        await bot.sendMessage(chatId, chunk, { parse_mode: 'HTML' });
                     } catch (e) {
-                        await bot.sendMessage(chatId, chunk);
+                        // If HTML fails (rare with this logic), strip tags and send raw
+                        await bot.sendMessage(chatId, chunk.replace(/<[^>]*>/g, ''));
                     }
                 }
 
