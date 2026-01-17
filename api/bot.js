@@ -210,6 +210,28 @@ export default async function handler(req, res) {
                 return res.status(200).json({});
             }
 
+            // --- NEW STAT COMMAND ---
+            if (userMessage === '/stat') {
+                try {
+                    await bot.sendChatAction(chatId, 'typing');
+                    const storedModel = await kv.get(modelKey);
+                    const currentModel = storedModel || DEFAULT_MODEL;
+                    const history = await kv.get(dbKey) || [];
+                    const tokens = await getAllTokens();
+
+                    const statMsg = `*ℹ️ System Status*\n\n` +
+                                    `• *Current Model:* \`${currentModel}\` ${storedModel ? '(User Set)' : '(Default)'}\n` +
+                                    `• *Memory Depth:* \`${history.length}\` messages\n` +
+                                    `• *Active Tokens:* \`${tokens.length}\`\n` +
+                                    `• *Router Model:* \`${ROUTER_MODEL}\``;
+
+                    await bot.sendMessage(chatId, statMsg, {parse_mode: 'Markdown'});
+                } catch (e) {
+                    await bot.sendMessage(chatId, `⚠️ Error fetching stats: ${e.message}`);
+                }
+                return res.status(200).json({});
+            }
+
             if (userMessage === '/cleartokens') {
                 await kv.set('extra_tokens', []);
                 await bot.sendMessage(chatId, "🗑️ Database tokens cleared.");
