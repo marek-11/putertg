@@ -8,16 +8,9 @@ const DEFAULT_MODEL = 'claude-opus-4-5'; // Main "Thinking" Brain
 const ROUTER_MODEL = 'gpt-4o';           // Fast "Decision" Brain
 
 // --- IMAGE MODEL MAPPING ---
-// Updated to use the latest working model IDs (Gemini 3 Pro)
+// Removed all other models. Default is now set to Flux Dev (High Quality).
 const IMAGE_MODELS = {
-    'default':  'black-forest-labs/FLUX.1-schnell',
-    '--flux':   'black-forest-labs/FLUX.1-schnell',
-    '--dev':    'black-forest-labs/FLUX.1-dev',
-    '--pro':    'black-forest-labs/FLUX.1-pro',
-    '--google': 'gemini-3-pro-image-preview', // Upgraded to "Nano Banana Pro"
-    '--nano':   'gemini-3-pro-image-preview', // Upgraded to "Nano Banana Pro"
-    '--dalle':  'dall-e-3',
-    '--sd':     'stabilityai/stable-diffusion-xl-base-1.0'
+    'default': 'black-forest-labs/FLUX.1-dev'
 };
 
 // --- HELPER 1: GET ALL TOKENS (ENV + DB) ---
@@ -293,29 +286,18 @@ export default async function handler(req, res) {
                 return res.status(200).json({});
             }
 
-            // --- 4. IMAGE GENERATION (FIXED & UPGRADED) ---
+            // --- 4. IMAGE GENERATION (SIMPLIFIED: FLUX DEV ONLY) ---
             if (userMessage.startsWith('/image')) {
                 let prompt = userMessage.replace('/image', '').trim();
                 
+                // Always use default (Flux Dev) since others are removed
                 let selectedModel = IMAGE_MODELS['default'];
-                let modelName = 'Flux (Default)';
-
-                // Detect Flags
-                for (const flag of Object.keys(IMAGE_MODELS)) {
-                    if (prompt.startsWith(flag)) {
-                        selectedModel = IMAGE_MODELS[flag];
-                        modelName = flag;
-                        prompt = prompt.replace(flag, '').trim();
-                        break;
-                    }
-                }
+                let modelName = 'Flux Dev';
 
                 if (!prompt) {
-                    const flags = Object.keys(IMAGE_MODELS).filter(k => k !== 'default').join(', ');
                     await bot.sendMessage(chatId, 
-                        `⚠️ *Usage:* \`/image [flag] <description>\`\n\n` + 
-                        `*Available Flags:*\n\`${flags}\`\n\n` +
-                        `*Example:* \`/image --google a futuristic city\``, 
+                        `⚠️ *Usage:* \`/image <description>\`\n\n` + 
+                        `*Example:* \`/image a futuristic city\``, 
                         {parse_mode: 'Markdown'}
                     );
                     return res.status(200).json({});
@@ -326,26 +308,21 @@ export default async function handler(req, res) {
                 // --- GENERATION FUNCTION ---
                 const generateAndSend = async (mId, mName, pmt) => {
                     const tokens = await getAllTokens();
-                    // Load balancing
                     const token = tokens[Math.floor(Math.random() * tokens.length)];
                     const puter = init(token);
                     
                     const imageResult = await puter.ai.txt2img(pmt, { model: mId });
                     
-                    // Normalize Result
                     let src = imageResult?.src || imageResult;
-                    if (typeof src !== 'string') {
-                        throw new Error(`Invalid response type: ${typeof src}`);
-                    }
+                    if (typeof src !== 'string') throw new Error(`Invalid response type: ${typeof src}`);
 
                     let finalImage;
                     if (src.startsWith('http')) {
-                        finalImage = src; // URL
+                        finalImage = src; 
                     } else if (src.startsWith('data:image')) {
                         const base64Data = src.split(',')[1];
                         finalImage = Buffer.from(base64Data, 'base64');
                     } else {
-                        // Attempt raw base64
                         finalImage = Buffer.from(src, 'base64');
                     }
 
@@ -355,23 +332,11 @@ export default async function handler(req, res) {
                     });
                 };
 
-                // --- EXECUTION WITH AUTO-FALLBACK ---
                 try {
                     await generateAndSend(selectedModel, modelName, prompt);
                 } catch (e) {
-                    console.warn(`Primary image model ${modelName} failed:`, e.message);
-                    
-                    // If specific model failed, retry with Flux
-                    if (selectedModel !== IMAGE_MODELS['default']) {
-                        await bot.sendMessage(chatId, `⚠️ ${modelName} failed. Retrying with Flux...`);
-                        try {
-                            await generateAndSend(IMAGE_MODELS['default'], 'Flux (Backup)', prompt);
-                        } catch (err2) {
-                            await bot.sendMessage(chatId, `❌ Backup failed too: ${err2.message}`);
-                        }
-                    } else {
-                        await bot.sendMessage(chatId, `❌ Image failed: ${e.message}`);
-                    }
+                    console.warn(`Image failed:`, e.message);
+                    await bot.sendMessage(chatId, `❌ Image failed: ${e.message}`);
                 }
                 return res.status(200).json({});
             }
