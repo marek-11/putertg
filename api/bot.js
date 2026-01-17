@@ -202,11 +202,14 @@ export default async function handler(req, res) {
                 }
                 return res.status(200).json({});
             }
+
+            // --- UPDATED RESET COMMAND ---
             if (userMessage === '/reset') {
                 await kv.del(modelKey);
-                await bot.sendMessage(chatId, `🔄 Reset to default.`);
+                await bot.sendMessage(chatId, `🔄 Reverted to the default model: \`${DEFAULT_MODEL}\``, {parse_mode: 'Markdown'});
                 return res.status(200).json({});
             }
+
             if (userMessage === '/cleartokens') {
                 await kv.set('extra_tokens', []);
                 await bot.sendMessage(chatId, "🗑️ Database tokens cleared.");
