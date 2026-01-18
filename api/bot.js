@@ -186,7 +186,6 @@ export default async function handler(req, res) {
             const userMessage = body.message.text.trim();
             const dbKey = `chat_history:${chatId}`;
             const modelKey = `model_pref:${chatId}`;
-            // Define prompt key for this chat
             const promptKey = `custom_prompt:${chatId}`;
 
             // Whitelist check
@@ -237,13 +236,10 @@ export default async function handler(req, res) {
                 return res.status(200).json({});
             }
 
-            // --- NEW: CUSTOM PROMPT COMMANDS ---
+            // --- 3. PROMPT MANAGEMENT ---
             if (userMessage.startsWith('/prompt')) {
-                // Remove '/prompt' and optional 'set' (case insensitive)
                 const input = userMessage.replace(/^\/prompt\s+(set\s+)?/i, '').trim();
-
                 if (!input) {
-                    // View current
                     const current = await kv.get(promptKey);
                     if (current) {
                         await bot.sendMessage(chatId, `<b>📜 Current Custom Prompt:</b>\n\n<code>${formatToHtml(current)}</code>`, { parse_mode: 'HTML' });
@@ -251,7 +247,6 @@ export default async function handler(req, res) {
                         await bot.sendMessage(chatId, `ℹ️ No custom prompt set. Using default system behavior.`);
                     }
                 } else {
-                    // Set new
                     await kv.set(promptKey, input);
                     await bot.sendMessage(chatId, `✅ <b>Custom Prompt Set!</b>\n\nIt will be appended to the system instructions.`, { parse_mode: 'HTML' });
                 }
@@ -264,6 +259,7 @@ export default async function handler(req, res) {
                 return res.status(200).json({});
             }
 
+            // --- 4. STATS & CLEANUP ---
             if (userMessage === '/stat') {
                 try {
                     await bot.sendChatAction(chatId, 'typing');
@@ -278,10 +274,8 @@ export default async function handler(req, res) {
                                     `• <b>Memory Depth:</b> <code>${history.length}</code> messages\n` +
                                     `• <b>Active Tokens:</b> <code>${tokens.length}</code>\n` +
                                     `• <b>Router Model:</b> <code>${ROUTER_MODEL}</code>`;
-
-                    if (customPrompt) {
-                        statMsg += `\n• <b>Custom Prompt:</b> Active ✅`;
-                    }
+                    
+                    if (customPrompt) statMsg += `\n• <b>Custom Prompt:</b> Active ✅`;
 
                     await bot.sendMessage(chatId, statMsg, {parse_mode: 'HTML'});
                 } catch (e) {
@@ -296,7 +290,46 @@ export default async function handler(req, res) {
                 return res.status(200).json({});
             }
 
-            // --- 3. TOKEN MANAGEMENT ---
+            // --- NEW: PRUNE COMMAND ---
+            if (userMessage === '/prune') {
+                await bot.sendChatAction(chatId, 'typing');
+                const dynamicTokens = await kv.get('extra_tokens') || [];
+
+                if (dynamicTokens.length === 0) {
+                    await bot.sendMessage(chatId, "ℹ️ No database tokens to prune.");
+                    return res.status(200).json({});
+                }
+
+                await bot.sendMessage(chatId, `⏳ <b>Checking ${dynamicTokens.length} tokens...</b>`, {parse_mode: 'HTML'});
+
+                // Parallel check for speed
+                const results = await Promise.all(dynamicTokens.map(async (token) => {
+                    try {
+                        const puter = init(token);
+                        const usage = await puter.auth.getMonthlyUsage();
+                        const remaining = usage?.allowanceInfo?.remaining;
+                        // Return null if balance is 0 or less
+                        if (typeof remaining === 'number' && remaining <= 0) return null;
+                        return token;
+                    } catch (e) {
+                        // If check fails (network/auth), keep token to be safe
+                        return token;
+                    }
+                }));
+
+                const keptTokens = results.filter(t => t !== null);
+                const removedCount = dynamicTokens.length - keptTokens.length;
+
+                if (removedCount > 0) {
+                    await kv.set('extra_tokens', keptTokens);
+                    await bot.sendMessage(chatId, `✂️ <b>Prune Complete!</b>\n\n🗑️ Deleted: <code>${removedCount}</code> empty tokens.\n✅ Remaining: <code>${keptTokens.length}</code> valid tokens.`, {parse_mode: 'HTML'});
+                } else {
+                    await bot.sendMessage(chatId, "✅ <b>No empty tokens found.</b>");
+                }
+                return res.status(200).json({});
+            }
+
+            // --- 5. MANUAL TOKEN DELETION ---
             if (userMessage.startsWith('/deltoken') || userMessage.startsWith('/deltokens')) {
                 const args = userMessage.replace(/^\/deltokens?/, '').trim();
                 const indices = args.split(/[\s,]+/).map(n => parseInt(n.trim())).filter(n => !isNaN(n));
@@ -340,7 +373,7 @@ export default async function handler(req, res) {
                 return res.status(200).json({});
             }
 
-            // --- 4. IMAGE GENERATION (FLUX DEV ONLY) ---
+            // --- 6. IMAGE GENERATION (FLUX DEV ONLY) ---
             if (userMessage.startsWith('/image')) {
                 let prompt = userMessage.replace('/image', '').trim();
                 let selectedModel = IMAGE_MODELS['default'];
@@ -391,7 +424,7 @@ export default async function handler(req, res) {
                 return res.status(200).json({});
             }
 
-            // --- 5. ADVANCED COMMANDS ---
+            // --- 7. ADVANCED COMMANDS ---
             if (userMessage === '/bal') {
                 try {
                     await bot.sendChatAction(chatId, 'typing');
@@ -457,7 +490,7 @@ export default async function handler(req, res) {
                     }
                     report += `-----------------------------\n`;
                     report += `<b>💰 TOTAL: $${grandTotal.toFixed(2)}</b>\n\n`;
-                    report += `<i>To delete, use:</i>\n<code>/deltokens 1, 2, 3</code>`;
+                    report += `<i>To delete, use:</i>\n<code>/deltokens 1, 2, 3</code>\n<i>To auto-delete empty:</i>\n<code>/prune</code>`;
                     
                     await bot.sendMessage(chatId, report, { parse_mode: 'HTML' });
                 } catch (e) {
@@ -512,7 +545,7 @@ export default async function handler(req, res) {
                 return res.status(200).json({});
             }
 
-            // --- 6. CHAT FLOW ---
+            // --- 8. CHAT FLOW ---
             await bot.sendChatAction(chatId, 'typing');
 
             try {
@@ -528,7 +561,6 @@ export default async function handler(req, res) {
                 // --- SYSTEM CONTEXT CONSTRUCTION ---
                 let systemContext = process.env.SYSTEM_PROMPT || "You are a helpful assistant.";
 
-                // Check for custom prompt
                 const customPrompt = await kv.get(promptKey);
                 if (customPrompt) {
                     systemContext += `\n\n[Additional Instructions]:\n${customPrompt}`;
@@ -554,18 +586,15 @@ export default async function handler(req, res) {
                 const finalResponse = await callAIWithRotation(answerMessages, activeModel);
 
                 // --- HTML FORMATTER & DB SAVE ---
-                // We keep the raw Markdown in the DB so context doesn't get messed up with tags
                 const dbContent = finalResponse + hiddenSearchData;
                 history.push({ role: 'assistant', content: dbContent });
                 
                 if (history.length > 20) history = history.slice(-20);
                 await kv.set(dbKey, history);
 
-                // Convert to HTML for Display
                 const htmlReply = formatToHtml(finalResponse.trim());
 
                 // --- SMART SPLITTER (HTML AWARE) ---
-                // Splitting by newline prevents breaking open HTML tags like <b>
                 let remaining = htmlReply;
                 while (remaining.length > 0) {
                     let chunk;
@@ -573,7 +602,6 @@ export default async function handler(req, res) {
                         chunk = remaining;
                         remaining = "";
                     } else {
-                        // Split at the last newline before 4000 limit
                         let splitAt = remaining.lastIndexOf('\n', 4000);
                         if (splitAt === -1) splitAt = 4000;
                         chunk = remaining.slice(0, splitAt);
@@ -582,7 +610,6 @@ export default async function handler(req, res) {
                     try {
                         await bot.sendMessage(chatId, chunk, { parse_mode: 'HTML' });
                     } catch (e) {
-                        // If HTML fails (rare with this logic), strip tags and send raw
                         await bot.sendMessage(chatId, chunk.replace(/<[^>]*>/g, ''));
                     }
                 }
