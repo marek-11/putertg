@@ -117,7 +117,7 @@ async function analyzeUserIntent(history, userMessage) {
     }
 }
 
-// --- HELPER 4: EXA.AI RESEARCHER (UPDATED) ---
+// --- HELPER 4: EXA.AI RESEARCHER ---
 async function performExaResearch(userQuery) {
     const apiKeyRaw = process.env.EXA_API_KEY; 
     if (!apiKeyRaw) return null;
@@ -135,7 +135,7 @@ async function performExaResearch(userQuery) {
             body: JSON.stringify({ 
                 query: userQuery,
                 useAutoprompt: true, 
-                numResults: 7, // UPDATED: Increased to 7 results
+                numResults: 2, 
                 contents: { text: true } 
             })
         });
@@ -147,8 +147,7 @@ async function performExaResearch(userQuery) {
 
         let context = ``;
         data.results.forEach((r, i) => {
-            // UPDATED: Reduced slice to 1000 to prevent context overflow
-            const snippet = r.text ? r.text.slice(0, 1000).replace(/\s+/g, " ") : "No text.";
+            const snippet = r.text ? r.text.slice(0, 1500).replace(/\s+/g, " ") : "No text.";
             context += `[Result ${i+1}] Title: ${r.title}\nURL: ${r.url}\nContent: ${snippet}\n\n`;
         });
         
