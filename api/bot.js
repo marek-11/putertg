@@ -211,11 +211,44 @@ export default async function handler(req, res) {
                 return res.status(200).json({});
             }
 
-            // --- 2. BASIC COMMANDS ---
+            // --- 2. BASIC COMMANDS & HELP ---
             if (userMessage === '/start') {
-                await bot.sendMessage(chatId, "Ready.");
+                await bot.sendMessage(chatId, "Ready. Type /help to see what I can do.");
                 return res.status(200).json({});
             }
+
+            if (userMessage === '/help') {
+                const helpMsg = `<b>🤖 Bot Command List</b>\n\n` +
+                    `<b>🔹 Basic</b>\n` +
+                    `/start - Check if bot is alive\n` +
+                    `/clear - Wipe chat memory\n` +
+                    `/help - Show this menu\n\n` +
+
+                    `<b>🧠 AI & Models</b>\n` +
+                    `/use &lt;model&gt; - Switch AI model\n` +
+                    `/reset - Revert to default model\n` +
+                    `/models - List all available models\n` +
+                    `/stat - Show current model & stats\n\n` +
+
+                    `<b>📝 Custom Instructions</b>\n` +
+                    `/prompt set &lt;text&gt; - Set custom system behavior\n` +
+                    `/prompt - View current custom prompt\n` +
+                    `/clearprompt - Remove custom prompt\n\n` +
+
+                    `<b>🎨 Creative</b>\n` +
+                    `/image &lt;text&gt; - Generate an image (Flux Dev)\n\n` +
+
+                    `<b>💳 Tokens & Balance</b>\n` +
+                    `/bal - Quick balance summary\n` +
+                    `/credits - Detailed token usage report\n` +
+                    `/prune - Auto-delete empty tokens ($0.00)\n` +
+                    `/deltoken &lt;id&gt; - Delete a specific token\n` +
+                    `<i>(Send a raw token string to add it)</i>`;
+
+                await bot.sendMessage(chatId, helpMsg, { parse_mode: 'HTML' });
+                return res.status(200).json({});
+            }
+
             if (userMessage === '/clear') {
                 await kv.set(dbKey, []);
                 await bot.sendMessage(chatId, "✅ Memory cleared.");
