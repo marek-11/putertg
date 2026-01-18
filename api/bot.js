@@ -186,6 +186,8 @@ export default async function handler(req, res) {
             const userMessage = body.message.text.trim();
             const dbKey = `chat_history:${chatId}`;
             const modelKey = `model_pref:${chatId}`;
+            // Define prompt key for this chat
+            const promptKey = `custom_prompt:${chatId}`;
 
             // Whitelist check
             const allowed = (process.env.WHITELIST || "").split(',').map(i => i.trim());
@@ -235,6 +237,33 @@ export default async function handler(req, res) {
                 return res.status(200).json({});
             }
 
+            // --- NEW: CUSTOM PROMPT COMMANDS ---
+            if (userMessage.startsWith('/prompt')) {
+                // Remove '/prompt' and optional 'set' (case insensitive)
+                const input = userMessage.replace(/^\/prompt\s+(set\s+)?/i, '').trim();
+
+                if (!input) {
+                    // View current
+                    const current = await kv.get(promptKey);
+                    if (current) {
+                        await bot.sendMessage(chatId, `<b>📜 Current Custom Prompt:</b>\n\n<code>${formatToHtml(current)}</code>`, { parse_mode: 'HTML' });
+                    } else {
+                        await bot.sendMessage(chatId, `ℹ️ No custom prompt set. Using default system behavior.`);
+                    }
+                } else {
+                    // Set new
+                    await kv.set(promptKey, input);
+                    await bot.sendMessage(chatId, `✅ <b>Custom Prompt Set!</b>\n\nIt will be appended to the system instructions.`, { parse_mode: 'HTML' });
+                }
+                return res.status(200).json({});
+            }
+
+            if (userMessage === '/clearprompt') {
+                await kv.del(promptKey);
+                await bot.sendMessage(chatId, "🔄 <b>Custom prompt cleared.</b> Reverted to global defaults.", { parse_mode: 'HTML' });
+                return res.status(200).json({});
+            }
+
             if (userMessage === '/stat') {
                 try {
                     await bot.sendChatAction(chatId, 'typing');
@@ -242,12 +271,17 @@ export default async function handler(req, res) {
                     const currentModel = storedModel || DEFAULT_MODEL;
                     const history = await kv.get(dbKey) || [];
                     const tokens = await getAllTokens();
+                    const customPrompt = await kv.get(promptKey);
 
-                    const statMsg = `<b>ℹ️ System Status</b>\n\n` +
+                    let statMsg = `<b>ℹ️ System Status</b>\n\n` +
                                     `• <b>Current Model:</b> <code>${currentModel}</code> ${storedModel ? '(User Set)' : '(Default)'}\n` +
                                     `• <b>Memory Depth:</b> <code>${history.length}</code> messages\n` +
                                     `• <b>Active Tokens:</b> <code>${tokens.length}</code>\n` +
                                     `• <b>Router Model:</b> <code>${ROUTER_MODEL}</code>`;
+
+                    if (customPrompt) {
+                        statMsg += `\n• <b>Custom Prompt:</b> Active ✅`;
+                    }
 
                     await bot.sendMessage(chatId, statMsg, {parse_mode: 'HTML'});
                 } catch (e) {
@@ -491,7 +525,15 @@ export default async function handler(req, res) {
                 const userModelPref = await kv.get(modelKey);
                 const activeModel = userModelPref || DEFAULT_MODEL;
                 
+                // --- SYSTEM CONTEXT CONSTRUCTION ---
                 let systemContext = process.env.SYSTEM_PROMPT || "You are a helpful assistant.";
+
+                // Check for custom prompt
+                const customPrompt = await kv.get(promptKey);
+                if (customPrompt) {
+                    systemContext += `\n\n[Additional Instructions]:\n${customPrompt}`;
+                }
+
                 let hiddenSearchData = "";
 
                 if (intent.action === 'SEARCH') {
