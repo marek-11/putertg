@@ -86,11 +86,14 @@ async function callAIWithRotation(messages, modelId = DEFAULT_MODEL) {
 // --- HELPER 3: INTENT ANALYZER (THE "ROUTER") ---
 async function analyzeUserIntent(history, userMessage) {
     const contextSlice = history.slice(-3); 
+    
+    // FIX 1: Get Manila Time for the Router
+    const nowManila = new Date().toLocaleString("en-US", { timeZone: "Asia/Manila" });
 
     const systemPrompt = `
     You are a Router. Decide if the user's message needs external information (Search) or if it is internal logic/conversation (Direct).
     
-    Current Date: ${new Date().toISOString()}
+    Current Date (Manila): ${nowManila}
 
     OUTPUT JSON ONLY:
     { "action": "SEARCH", "query": "optimized search query" } 
@@ -592,7 +595,13 @@ export default async function handler(req, res) {
                 const activeModel = userModelPref || DEFAULT_MODEL;
                 
                 // --- SYSTEM CONTEXT CONSTRUCTION ---
+                // FIX 2: Get Manila Time for the Main Chat
+                const nowManila = new Date().toLocaleString("en-US", { timeZone: "Asia/Manila", dateStyle: "full", timeStyle: "short" });
+
                 let systemContext = process.env.SYSTEM_PROMPT || "You are a helpful assistant.";
+                
+                // FIX 2: Inject Date into Context
+                systemContext += `\n\n[System Time]: Today is ${nowManila} (Asia/Manila).`;
 
                 const customPrompt = await kv.get(promptKey);
                 if (customPrompt) {
