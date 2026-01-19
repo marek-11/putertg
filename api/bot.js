@@ -83,20 +83,47 @@ async function callAIWithRotation(messages, modelId = DEFAULT_MODEL) {
     throw new Error(`All tokens failed. Last error: ${lastError?.message}`);
 }
 
-// --- HELPER 3: INTENT ANALYZER (THE "ROUTER") ---
+// --- HELPER 3: INTENT ANALYZER (OPTIMIZED ROUTER) ---
 async function analyzeUserIntent(history, userMessage) {
+    const lowerMsg = userMessage.toLowerCase();
+
+    // 1. FAST PATH: REGEX CHECKS (Skip LLM)
+    // Force SEARCH for explicit information gathering
+    const searchTriggers = [
+        /^search\b/i, /^find\b/i, /^who is\b/i, /^what is\b/i, 
+        /weather/i, /news/i, /price of/i, /latest/i, /current/i,
+        /stock/i, /movie times/i, /schedule/i
+    ];
+    if (searchTriggers.some(regex => regex.test(userMessage))) {
+        return { action: "SEARCH", query: userMessage }; 
+    }
+
+    // Force DIRECT for conversational filler or code help
+    const directTriggers = [
+        /^hi\b/i, /^hello\b/i, /^ok\b/i, /^thanks\b/i, /^cool\b/i, 
+        /^write code/i, /^fix/i, /^debug/i, /^explain/i, /^help/i
+    ];
+    if (directTriggers.some(regex => regex.test(userMessage))) {
+        return { action: "DIRECT" };
+    }
+
+    // 2. SLOW PATH: LLM ANALYSIS (For ambiguous queries)
     const contextSlice = history.slice(-3); 
-    
-    // FIX 1: Get Manila Time for the Router
     const nowManila = new Date().toLocaleString("en-US", { timeZone: "Asia/Manila" });
 
     const systemPrompt = `
-    You are a Router. Decide if the user's message needs external information (Search) or if it is internal logic/conversation (Direct).
+    You are a Router. Your job is to classify the user's need.
     
     Current Date (Manila): ${nowManila}
 
+    RULES:
+    - IF the user asks about real-time events, news, stocks, weather, or "recent" data -> "SEARCH".
+    - IF the user asks for factual knowledge that might be outdated (e.g. "Who is the CEO of X?") -> "SEARCH".
+    - IF the user asks for coding, creative writing, translation, or general explanations -> "DIRECT".
+    - IF the user refers to "this" or context from previous messages -> "DIRECT".
+
     OUTPUT JSON ONLY:
-    { "action": "SEARCH", "query": "optimized search query" } 
+    { "action": "SEARCH", "query": "optimized keyword search query" } 
     OR 
     { "action": "DIRECT" }
     `;
