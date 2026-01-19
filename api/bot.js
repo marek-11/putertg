@@ -273,15 +273,25 @@ export default async function handler(req, res) {
             }
 
             // --- 3. PROMPT MANAGEMENT ---
-            if (userMessage.startsWith('/prompt')) {
-                const input = userMessage.replace(/^\/prompt\s+(set\s+)?/i, '').trim();
+            
+            // VIEW: Handle exactly "/prompt"
+            if (userMessage === '/prompt') {
+                const current = await kv.get(promptKey);
+                if (current) {
+                    await bot.sendMessage(chatId, `<b>📜 Current Custom Prompt:</b>\n\n<code>${formatToHtml(current)}</code>`, { parse_mode: 'HTML' });
+                } else {
+                    await bot.sendMessage(chatId, "System Prompt is default.");
+                }
+                return res.status(200).json({});
+            }
+
+            // SET: Handle "/prompt set <text>"
+            if (userMessage.startsWith('/prompt set')) {
+                // Strip the command part to get the arguments
+                const input = userMessage.replace(/^\/prompt\s+set/i, '').trim();
+
                 if (!input) {
-                    const current = await kv.get(promptKey);
-                    if (current) {
-                        await bot.sendMessage(chatId, `<b>📜 Current Custom Prompt:</b>\n\n<code>${formatToHtml(current)}</code>`, { parse_mode: 'HTML' });
-                    } else {
-                        await bot.sendMessage(chatId, `ℹ️ No custom prompt set. Using default system behavior.`);
-                    }
+                    await bot.sendMessage(chatId, "Prompt is empty and null.");
                 } else {
                     await kv.set(promptKey, input);
                     await bot.sendMessage(chatId, `✅ <b>Custom Prompt Set!</b>\n\nIt will be appended to the system instructions.`, { parse_mode: 'HTML' });
@@ -289,6 +299,7 @@ export default async function handler(req, res) {
                 return res.status(200).json({});
             }
 
+            // CLEAR: Handle "/clearprompt"
             if (userMessage === '/clearprompt') {
                 await kv.del(promptKey);
                 await bot.sendMessage(chatId, "🔄 <b>Custom prompt cleared.</b> Reverted to global defaults.", { parse_mode: 'HTML' });
